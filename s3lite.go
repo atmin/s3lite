@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/benbjohnson/litestream"
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
@@ -22,6 +24,8 @@ type Config struct {
 
 type DB struct {
 	*sql.DB
+	lsDB  *litestream.DB
+	store *litestream.Store
 }
 
 func Open(ctx context.Context, cfg Config) (*DB, error) {
@@ -33,8 +37,35 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 
+	db := &DB{}
+
+	if cfg.BackupTo != "" {
+		client, err := newReplicaClient(cfg.BackupTo)
+		if err != nil {
+			return nil, err
+		}
+
+		lsDB := litestream.NewDB(cfg.LocalPath)
+		replica := litestream.NewReplicaWithClient(lsDB, client)
+		lsDB.Replica = replica
+		wireReplica(client, replica)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: 10 * time.Second},
+		}
+		store := litestream.NewStore([]*litestream.DB{lsDB}, levels)
+		if err := store.Open(ctx); err != nil {
+			return nil, fmt.Errorf("s3lite: litestream open: %w", err)
+		}
+
+		db.lsDB = lsDB
+		db.store = store
+	}
+
 	sqlDB, err := sql.Open("sqlite3", cfg.LocalPath)
 	if err != nil {
+		db.closeReplication(ctx)
 		return nil, err
 	}
 
@@ -45,21 +76,51 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	} {
 		if _, err := sqlDB.ExecContext(ctx, pragma); err != nil {
 			sqlDB.Close()
+			db.closeReplication(ctx)
 			return nil, err
 		}
 	}
 
 	if err := sqlDB.PingContext(ctx); err != nil {
 		sqlDB.Close()
+		db.closeReplication(ctx)
 		return nil, err
 	}
 
 	for i, m := range cfg.Migrations {
 		if _, err := sqlDB.ExecContext(ctx, m); err != nil {
 			sqlDB.Close()
+			db.closeReplication(ctx)
 			return nil, fmt.Errorf("s3lite: migration %d: %w", i, err)
 		}
 	}
 
-	return &DB{sqlDB}, nil
+	db.DB = sqlDB
+	return db, nil
+}
+
+func (db *DB) Close() error {
+	var firstErr error
+	save := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	save(db.DB.Close())
+	save(db.closeReplication(context.Background()))
+	return firstErr
+}
+
+func (db *DB) Sync(ctx context.Context) error {
+	if db.lsDB == nil {
+		return nil
+	}
+	return db.lsDB.SyncAndWait(ctx)
+}
+
+func (db *DB) closeReplication(ctx context.Context) error {
+	if db.store != nil {
+		return db.store.Close(ctx)
+	}
+	return nil
 }

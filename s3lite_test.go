@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/atmin/s3lite"
 	_ "github.com/ncruces/go-sqlite3/driver"
@@ -149,5 +150,56 @@ func TestBadMigrationReturnsError(t *testing.T) {
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Fatalf("file should still exist after failed migration, got: %v", statErr)
+	}
+}
+
+func TestBackupToFileReplica(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite3")
+	replicaDir := t.TempDir()
+
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: dbPath,
+		BackupTo:  "file://" + replicaDir,
+		Migrations: []string{
+			`CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('hello')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Poll for LTX files (litestream writes asynchronously).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		matches, _ := filepath.Glob(filepath.Join(replicaDir, "ltx", "0", "*.ltx"))
+		if len(matches) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for litestream to write LTX files")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBackupBadSchemeError(t *testing.T) {
+	ctx := context.Background()
+	_, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: filepath.Join(t.TempDir(), "test.sqlite3"),
+		BackupTo:  "ftp://some/path",
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported scheme")
 	}
 }
