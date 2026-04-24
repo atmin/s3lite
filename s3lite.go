@@ -39,6 +39,14 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 
 	db := &DB{}
 
+	if cfg.RestoreFrom != "" {
+		if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
+			if err := restoreDB(ctx, cfg.RestoreFrom, cfg.LocalPath); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	if cfg.BackupTo != "" {
 		client, err := newReplicaClient(cfg.BackupTo)
 		if err != nil {

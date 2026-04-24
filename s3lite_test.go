@@ -203,3 +203,101 @@ func TestBackupBadSchemeError(t *testing.T) {
 		t.Fatal("expected error for unsupported scheme")
 	}
 }
+
+func TestRestoreRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	root := t.TempDir()
+	replicaDir := filepath.Join(root, "replica")
+	replicaURL := "file://" + replicaDir
+
+	// Write DB1 and wait for LTX files.
+	db1Path := filepath.Join(root, "db1.sqlite3")
+	db1, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: db1Path,
+		BackupTo:  replicaURL,
+		Migrations: []string{
+			`CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('hello')`); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		matches, _ := filepath.Glob(filepath.Join(replicaDir, "ltx", "0", "*.ltx"))
+		if len(matches) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for LTX files")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore into DB2 and verify row is present.
+	db2Path := filepath.Join(root, "db2.sqlite3")
+	db2, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath:   db2Path,
+		RestoreFrom: replicaURL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	var name string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "hello" {
+		t.Fatalf("expected hello, got %s", name)
+	}
+}
+
+func TestRestoreFromEmptyReplicaSucceeds(t *testing.T) {
+	ctx := context.Background()
+	emptyDir := t.TempDir()
+
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath:   filepath.Join(t.TempDir(), "db.sqlite3"),
+		RestoreFrom: "file://" + emptyDir,
+	})
+	if err != nil {
+		t.Fatalf("expected success for empty replica, got: %v", err)
+	}
+	db.Close()
+}
+
+func TestRestoreSkippedWhenLocalExists(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "db.sqlite3")
+
+	// Pre-create the file with marker content.
+	if err := os.WriteFile(dbPath, []byte("marker"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open with RestoreFrom pointing at an empty dir — restore should be skipped.
+	// The open will fail (not a valid SQLite file) but the file must be untouched.
+	s3lite.Open(ctx, s3lite.Config{ //nolint:errcheck
+		LocalPath:   dbPath,
+		RestoreFrom: "file://" + t.TempDir(),
+	})
+
+	content, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "marker" {
+		t.Fatal("restore clobbered existing local file")
+	}
+}
