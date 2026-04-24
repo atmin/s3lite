@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -51,6 +52,13 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if err := sqlDB.PingContext(ctx); err != nil {
 		sqlDB.Close()
 		return nil, err
+	}
+
+	for i, m := range cfg.Migrations {
+		if _, err := sqlDB.ExecContext(ctx, m); err != nil {
+			sqlDB.Close()
+			return nil, fmt.Errorf("s3lite: migration %d: %w", i, err)
+		}
 	}
 
 	return &DB{sqlDB}, nil
