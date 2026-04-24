@@ -47,3 +47,24 @@ func Example_basic() {
 
 	// Output: alice@example.com
 }
+
+// Example_s3 shows the S3 replica URL form. Credentials are read from the
+// standard AWS environment variables (AWS_REGION, AWS_ACCESS_KEY_ID,
+// AWS_SECRET_ACCESS_KEY, and optionally AWS_ENDPOINT_URL for non-AWS S3).
+func Example_s3() {
+	ctx := context.Background()
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath:   "/tmp/app.sqlite3",
+		RestoreFrom: "s3://my-bucket/db",
+		BackupTo:    "s3://my-bucket/db",
+		Migrations: []string{
+			`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT)`,
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	_ = db // use db as a standard *sql.DB
+}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,6 +154,52 @@ func TestBadMigrationReturnsError(t *testing.T) {
 	}
 }
 
+func TestMigrationsRunInOrder(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.sqlite3")
+
+	// If migrations ran out of order, the INSERT would fail because the table
+	// wouldn't exist yet.
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: path,
+		Migrations: []string{
+			`CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)`,
+			`INSERT INTO items (name) VALUES ('seed')`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var name string
+	if err := db.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	if name != "seed" {
+		t.Fatalf("expected seed, got %s", name)
+	}
+}
+
+func TestMigrationErrorWrapsIndex(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.sqlite3")
+
+	_, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: path,
+		Migrations: []string{
+			`CREATE TABLE items (id INTEGER PRIMARY KEY)`,
+			`THIS IS NOT SQL`,
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "migration 1") {
+		t.Errorf("error should identify failing migration by index, got: %v", err)
+	}
+}
+
 func TestBackupToFileReplica(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -212,7 +259,6 @@ func TestRestoreRoundTrip(t *testing.T) {
 	replicaDir := filepath.Join(root, "replica")
 	replicaURL := "file://" + replicaDir
 
-	// Write DB1 and wait for LTX files.
 	db1Path := filepath.Join(root, "db1.sqlite3")
 	db1, err := s3lite.Open(ctx, s3lite.Config{
 		LocalPath: db1Path,
@@ -227,16 +273,8 @@ func TestRestoreRoundTrip(t *testing.T) {
 	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('hello')`); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		matches, _ := filepath.Glob(filepath.Join(replicaDir, "ltx", "0", "*.ltx"))
-		if len(matches) > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for LTX files")
-		}
-		time.Sleep(100 * time.Millisecond)
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if err := db1.Close(); err != nil {
 		t.Fatal(err)
