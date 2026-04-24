@@ -32,6 +32,21 @@ type Config struct {
 	// Migrations are SQL strings executed in order on every Open. Each must be
 	// idempotent (e.g. CREATE TABLE IF NOT EXISTS) — there is no version table.
 	Migrations []string
+
+	// S3 configures s3:// replicas. Applies to both RestoreFrom and BackupTo.
+	// Empty fields fall back to the AWS SDK's default credential and region chain
+	// (env vars, ~/.aws/config, IAM roles). Set Endpoint for MinIO or other
+	// S3-compatible providers — path-style addressing is enabled automatically.
+	S3 S3Config
+}
+
+// S3Config holds S3 connection settings. Callers are responsible for sourcing
+// these values (e.g. from environment variables).
+type S3Config struct {
+	Region          string
+	Endpoint        string
+	AccessKeyID     string
+	SecretAccessKey string
 }
 
 // DB wraps *sql.DB with optional litestream replication.
@@ -64,14 +79,14 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 
 	if cfg.RestoreFrom != "" {
 		if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
-			if err := restoreDB(ctx, cfg.RestoreFrom, cfg.LocalPath); err != nil {
+			if err := restoreDB(ctx, cfg.S3, cfg.RestoreFrom, cfg.LocalPath); err != nil {
 				return nil, err
 			}
 		}
 	}
 
 	if cfg.BackupTo != "" {
-		client, err := newReplicaClient(cfg.BackupTo)
+		client, err := newReplicaClient(cfg.S3, cfg.BackupTo)
 		if err != nil {
 			return nil, err
 		}

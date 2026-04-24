@@ -15,6 +15,12 @@ db, err := s3lite.Open(ctx, s3lite.Config{
     LocalPath:   "/tmp/db.sqlite3",
     RestoreFrom: "s3://my-bucket/db",
     BackupTo:    "s3://my-bucket/db",
+    S3: s3lite.S3Config{
+        Region:          os.Getenv("AWS_REGION"),
+        Endpoint:        os.Getenv("AWS_ENDPOINT_URL"), // for MinIO/Scaleway/etc.
+        AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+        SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+    },
     Migrations: []string{
         `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT)`,
         `CREATE INDEX IF NOT EXISTS users_email ON users(email)`,
@@ -33,11 +39,10 @@ Point `RestoreFrom` and `BackupTo` at the same URL — restore what you've been 
 
 ## Configuration
 
-S3 credentials are read from the environment:
-
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-- `AWS_REGION`
-- `AWS_ENDPOINT_URL` (for non-AWS S3, e.g. Scaleway or MinIO)
+s3lite itself reads no environment variables. Pass S3 settings via `S3Config`.
+Empty fields fall through to the AWS SDK's default credential chain (env vars,
+`~/.aws/config`, IAM roles), so on EC2/ECS/Lambda you can leave credentials
+blank and rely on the instance role.
 
 ## Limitations
 

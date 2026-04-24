@@ -5,23 +5,43 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
-	_ "github.com/benbjohnson/litestream/s3"
+	lss3 "github.com/benbjohnson/litestream/s3"
 )
 
-func newReplicaClient(rawURL string) (litestream.ReplicaClient, error) {
+func newReplicaClient(s3Cfg S3Config, rawURL string) (litestream.ReplicaClient, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("s3lite: invalid replica URL: %w", err)
 	}
 	switch u.Scheme {
-	case "file", "s3":
+	case "file":
 		return litestream.NewReplicaClientFromURL(rawURL)
+	case "s3":
+		return newS3ReplicaClient(s3Cfg, u)
 	default:
 		return nil, fmt.Errorf("s3lite: unsupported replica scheme %q (supported: file, s3)", u.Scheme)
 	}
+}
+
+func newS3ReplicaClient(s3Cfg S3Config, u *url.URL) (*lss3.ReplicaClient, error) {
+	bucket := u.Host
+	if bucket == "" {
+		return nil, fmt.Errorf("s3lite: s3 replica URL requires a bucket (got %q)", u.String())
+	}
+	client := lss3.NewReplicaClient()
+	client.Bucket = bucket
+	client.Path = strings.TrimPrefix(u.Path, "/")
+	client.Region = s3Cfg.Region
+	client.Endpoint = s3Cfg.Endpoint
+	client.AccessKeyID = s3Cfg.AccessKeyID
+	client.SecretAccessKey = s3Cfg.SecretAccessKey
+	// Custom endpoints (MinIO, Scaleway, etc.) need path-style addressing.
+	client.ForcePathStyle = s3Cfg.Endpoint != ""
+	return client, nil
 }
 
 // isEmptyReplica reports whether err means the replica exists but has no data yet —
@@ -37,8 +57,8 @@ func wireReplica(client litestream.ReplicaClient, replica *litestream.Replica) {
 	}
 }
 
-func restoreDB(ctx context.Context, rawURL, destPath string) error {
-	client, err := newReplicaClient(rawURL)
+func restoreDB(ctx context.Context, s3Cfg S3Config, rawURL, destPath string) error {
+	client, err := newReplicaClient(s3Cfg, rawURL)
 	if err != nil {
 		return err
 	}

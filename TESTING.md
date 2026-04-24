@@ -50,10 +50,18 @@ func main() {
 	ctx := context.Background()
 	bucket := os.Args[1] // e.g. s3://test/smokedb
 
+	s3cfg := s3lite.S3Config{
+		Region:          os.Getenv("AWS_REGION"),
+		Endpoint:        os.Getenv("AWS_ENDPOINT_URL"),
+		AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+	}
+
 	// Write pass
 	db, err := s3lite.Open(ctx, s3lite.Config{
 		LocalPath: "/tmp/smoke.sqlite3",
 		BackupTo:  bucket,
+		S3:        s3cfg,
 		Migrations: []string{
 			`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, val TEXT)`,
 		},
@@ -76,6 +84,7 @@ func main() {
 	db2, err := s3lite.Open(ctx, s3lite.Config{
 		LocalPath:   "/tmp/smoke-restored.sqlite3",
 		RestoreFrom: bucket,
+		S3:          s3cfg,
 	})
 	if err != nil {
 		log.Fatal("restore open:", err)
