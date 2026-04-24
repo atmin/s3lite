@@ -13,7 +13,7 @@ A small Go service deployed as a serverless container with ephemeral storage. Da
 ```go
 db, err := s3lite.Open(ctx, s3lite.Config{
     LocalPath:   "/tmp/db.sqlite3",
-    RestoreFrom: "s3://my-bucket/db", // omit on first deploy
+    RestoreFrom: "s3://my-bucket/db",
     BackupTo:    "s3://my-bucket/db",
     Migrations: []string{
         `CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT)`,
@@ -28,6 +28,8 @@ defer db.Close()
 // db embeds *sql.DB — use it directly
 rows, err := db.QueryContext(ctx, "SELECT id, email FROM users")
 ```
+
+Point `RestoreFrom` and `BackupTo` at the same URL — restore what you've been backing up. On first deploy the replica is empty; `Open` handles that as a no-op and starts with a fresh DB.
 
 ## Configuration
 
