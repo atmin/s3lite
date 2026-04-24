@@ -1,3 +1,5 @@
+// Package s3lite provides S3-backed embedded SQLite for serverless containers.
+// It wraps litestream for continuous replication and a CGO-free SQLite driver.
 package s3lite
 
 import (
@@ -13,21 +15,42 @@ import (
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
+// Config holds the options for Open.
 type Config struct {
-	LocalPath   string
+	// LocalPath is the on-disk path for the SQLite file. Required.
+	LocalPath string
+
+	// RestoreFrom is a replica URL (file:// or s3://) to restore from on startup
+	// when LocalPath does not yet exist. Ignored if LocalPath already exists.
+	// Safe to set on first deploy — an empty replica is not an error.
 	RestoreFrom string
-	BackupTo    string
+
+	// BackupTo is a replica URL (file:// or s3://) to replicate to continuously.
+	// Omit to run without replication.
+	BackupTo string
+
 	// Migrations are SQL strings executed in order on every Open. Each must be
 	// idempotent (e.g. CREATE TABLE IF NOT EXISTS) — there is no version table.
 	Migrations []string
 }
 
+// DB wraps *sql.DB with optional litestream replication.
+// All *sql.DB methods are available directly via embedding.
 type DB struct {
 	*sql.DB
 	lsDB  *litestream.DB
 	store *litestream.Store
 }
 
+// Open opens or creates a SQLite database at cfg.LocalPath.
+//
+// Lifecycle:
+//  1. If RestoreFrom is set and LocalPath does not exist, restore from replica.
+//  2. Start litestream replication if BackupTo is set.
+//  3. Open the SQLite connection and apply WAL pragmas.
+//  4. Run Migrations in order.
+//
+// Call Close when done to flush replication and release resources.
 func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if cfg.LocalPath == "" {
 		return nil, errors.New("s3lite: LocalPath is required")
@@ -107,6 +130,8 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	return db, nil
 }
 
+// Close flushes pending replication, stops litestream, and closes the database.
+// Returns the first non-nil error encountered.
 func (db *DB) Close() error {
 	var firstErr error
 	save := func(err error) {
@@ -119,6 +144,8 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
+// Sync blocks until the replica is caught up with the current database state.
+// It is a no-op when BackupTo is not configured.
 func (db *DB) Sync(ctx context.Context) error {
 	if db.lsDB == nil {
 		return nil
