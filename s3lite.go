@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -101,6 +102,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 			{Level: 1, Interval: 10 * time.Second},
 		}
 		store := litestream.NewStore([]*litestream.DB{lsDB}, levels)
+		store.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 		if err := store.Open(ctx); err != nil {
 			return nil, fmt.Errorf("s3lite: litestream open: %w", err)
 		}
