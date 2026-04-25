@@ -39,6 +39,11 @@ type Config struct {
 	// (env vars, ~/.aws/config, IAM roles). Set Endpoint for MinIO or other
 	// S3-compatible providers — path-style addressing is enabled automatically.
 	S3 S3Config
+
+	// Logger receives litestream's log records. When nil, INFO is suppressed
+	// and WARN+ is written to stderr. Set to slog.Default() to mirror the
+	// host application's logging.
+	Logger *slog.Logger
 }
 
 // S3Config holds S3 connection settings. Callers are responsible for sourcing
@@ -101,8 +106,14 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 			{Level: 0},
 			{Level: 1, Interval: 10 * time.Second},
 		}
+		logger := cfg.Logger
+		if logger == nil {
+			logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		}
 		store := litestream.NewStore([]*litestream.DB{lsDB}, levels)
-		store.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		// NewStore resets db.Logger inside its constructor, so override after.
+		store.Logger = logger.With(litestream.LogKeySystem, litestream.LogSystemStore)
+		lsDB.SetLogger(store.Logger.With(litestream.LogKeyDB, filepath.Base(cfg.LocalPath)))
 		if err := store.Open(ctx); err != nil {
 			return nil, fmt.Errorf("s3lite: litestream open: %w", err)
 		}

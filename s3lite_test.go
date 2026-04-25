@@ -1,11 +1,14 @@
 package s3lite_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -238,6 +241,60 @@ func TestBackupToFileReplica(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestCustomLoggerReceivesLitestreamLogs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	buf := &lockedBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite3")
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: dbPath,
+		BackupTo:  "file://" + t.TempDir(),
+		Logger:    logger,
+		Migrations: []string{
+			`CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('hello')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "replica sync") {
+		t.Fatalf("expected litestream logs in custom logger output; got:\n%s", out)
+	}
+}
+
+// lockedBuffer is bytes.Buffer with a mutex — litestream writes from a
+// background goroutine so the test's reader and the writer race otherwise.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestBackupBadSchemeError(t *testing.T) {
