@@ -91,14 +91,15 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		}
 	}
 
-	// Pre-create the database so litestream starts on an existing, initialized file.
-	// Without this, litestream races with the app's sql.Open on first deploy (empty bucket).
+	// Pre-create the database in WAL mode so litestream starts on an existing WAL-mode file.
+	// Without this, litestream starts on a non-WAL database, then the app's PRAGMA journal_mode=WAL
+	// switches the journal mode underneath it, causing locking protocol errors.
 	if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
 		tmpDB, err := sql.Open("sqlite3", cfg.LocalPath)
 		if err != nil {
 			return nil, err
 		}
-		err = tmpDB.PingContext(ctx)
+		_, err = tmpDB.ExecContext(ctx, "PRAGMA journal_mode=WAL")
 		tmpDB.Close()
 		if err != nil {
 			return nil, err
