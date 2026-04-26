@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
-	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "modernc.org/sqlite"
 )
 
 // Config holds the options for Open.
@@ -95,7 +95,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	// Without this, litestream starts on a non-WAL database, then the app's PRAGMA journal_mode=WAL
 	// switches the journal mode underneath it, causing locking protocol errors.
 	if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
-		tmpDB, err := sql.Open("sqlite3", cfg.LocalPath)
+		tmpDB, err := sql.Open("sqlite", cfg.LocalPath)
 		if err != nil {
 			return nil, err
 		}
@@ -137,7 +137,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		db.store = store
 	}
 
-	sqlDB, err := sql.Open("sqlite3", cfg.LocalPath)
+	sqlDB, err := sql.Open("sqlite", cfg.LocalPath)
 	if err != nil {
 		db.closeReplication(ctx)
 		return nil, err
