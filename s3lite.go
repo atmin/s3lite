@@ -91,6 +91,20 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		}
 	}
 
+	// Pre-create the database so litestream starts on an existing, initialized file.
+	// Without this, litestream races with the app's sql.Open on first deploy (empty bucket).
+	if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
+		tmpDB, err := sql.Open("sqlite3", cfg.LocalPath)
+		if err != nil {
+			return nil, err
+		}
+		err = tmpDB.PingContext(ctx)
+		tmpDB.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if cfg.BackupTo != "" {
 		client, err := newReplicaClient(cfg.S3, cfg.BackupTo)
 		if err != nil {

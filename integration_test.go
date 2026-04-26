@@ -68,6 +68,34 @@ func TestRestoreRoundTripS3(t *testing.T) {
 	}
 }
 
+func TestFirstDeployEmptyBucket(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	_, s3cfg := startMinIO(ctx, t, "fresh")
+	bucketURL := "s3://fresh/firstdb"
+
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: filepath.Join(t.TempDir(), "first.sqlite3"),
+		BackupTo:  bucketURL,
+		S3:        s3cfg,
+		Migrations: []string{
+			`CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO kv VALUES ('x', '1')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("sync after first deploy: %v", err)
+	}
+}
+
 func startMinIO(ctx context.Context, t *testing.T, bucket string) (endpoint string, cfg s3lite.S3Config) {
 	t.Helper()
 
