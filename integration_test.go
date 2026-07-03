@@ -96,6 +96,66 @@ func TestFirstDeployEmptyBucket(t *testing.T) {
 	}
 }
 
+func TestLeaseMutualExclusionAndHandoffS3(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	_, s3cfg := startMinIO(ctx, t, "leased")
+	bucketURL := "s3://leased/db"
+	root := t.TempDir()
+	ttl := 3 * time.Second
+
+	openAuto := func(owner string) *s3lite.DB {
+		t.Helper()
+		db, err := s3lite.Open(ctx, s3lite.Config{
+			LocalPath:  filepath.Join(root, owner+".sqlite3"),
+			BackupTo:   bucketURL,
+			S3:         s3cfg,
+			Role:       s3lite.RoleAuto,
+			Owner:      owner,
+			LeaseTTL:   ttl,
+			Migrations: []string{`CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`},
+		})
+		if err != nil {
+			t.Fatalf("open %s: %v", owner, err)
+		}
+		return db
+	}
+
+	// Two Auto instances against one replica: exactly one wins the lease.
+	db1 := openAuto("a")
+	db2 := openAuto("b")
+	defer db2.Close()
+
+	if !db1.IsLeader() || db2.IsLeader() {
+		t.Fatalf("expected exactly one leader (a); a=%v b=%v", db1.IsLeader(), db2.IsLeader())
+	}
+
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('leased-row')`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// Durable Close flushes the row and releases the lease for the successor.
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close leader: %v", err)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for !db2.IsLeader() {
+		if time.Now().After(deadline) {
+			t.Fatal("follower did not promote after leader released the lease")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	var name string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatalf("promoted follower cannot read replicated row: %v", err)
+	}
+	if name != "leased-row" {
+		t.Fatalf("expected leased-row, got %s", name)
+	}
+}
+
 func startMinIO(ctx context.Context, t *testing.T, bucket string) (endpoint string, cfg s3lite.S3Config) {
 	t.Helper()
 
