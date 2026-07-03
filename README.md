@@ -48,4 +48,6 @@ blank and rely on the instance role.
 
 - Single writer. Run exactly one container instance.
 - Restore happens on Open — cold starts pay this cost (typically sub-second for small DBs).
-- Sub-second write-loss window if the container crashes before litestream syncs.
+- A clean `Close` is durable: it flushes all committed writes to the replica
+  before returning (bounded by `Config.ShutdownSyncTimeout`, default 30s). Only a
+  *hard* crash/kill can lose the sub-second window since litestream's last sync.

@@ -44,7 +44,19 @@ type Config struct {
 	// and WARN+ is written to stderr. Set to slog.Default() to mirror the
 	// host application's logging.
 	Logger *slog.Logger
+
+	// ShutdownSyncTimeout bounds the final durable flush performed by Close on a
+	// replicated DB. Close blocks up to this long waiting for the replica to
+	// catch up before it gives up (returning an error) rather than hanging on an
+	// unreachable replica. When zero, DefaultShutdownSyncTimeout (30s) is used.
+	// Ignored when BackupTo is empty. CloseContext ignores this in favour of the
+	// caller-supplied context deadline.
+	ShutdownSyncTimeout time.Duration
 }
+
+// DefaultShutdownSyncTimeout is the flush deadline Close uses when
+// Config.ShutdownSyncTimeout is zero.
+const DefaultShutdownSyncTimeout = 30 * time.Second
 
 // S3Config holds S3 connection settings. Callers are responsible for sourcing
 // these values (e.g. from environment variables).
@@ -59,8 +71,9 @@ type S3Config struct {
 // All *sql.DB methods are available directly via embedding.
 type DB struct {
 	*sql.DB
-	lsDB  *litestream.DB
-	store *litestream.Store
+	lsDB                *litestream.DB
+	store               *litestream.Store
+	shutdownSyncTimeout time.Duration
 }
 
 // Open opens or creates a SQLite database at cfg.LocalPath.
@@ -81,7 +94,11 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 
-	db := &DB{}
+	shutdownSyncTimeout := cfg.ShutdownSyncTimeout
+	if shutdownSyncTimeout <= 0 {
+		shutdownSyncTimeout = DefaultShutdownSyncTimeout
+	}
+	db := &DB{shutdownSyncTimeout: shutdownSyncTimeout}
 
 	if cfg.RestoreFrom != "" {
 		if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
@@ -129,6 +146,9 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		// NewStore resets db.Logger inside its constructor, so override after.
 		store.Logger = logger.With(litestream.LogKeySystem, litestream.LogSystemStore)
 		lsDB.SetLogger(store.Logger.With(litestream.LogKeyDB, filepath.Base(cfg.LocalPath)))
+		// Make store.Close perform a bounded, durable final sync so a clean Close
+		// flushes all committed writes. SetShutdownSyncTimeout propagates to lsDB.
+		store.SetShutdownSyncTimeout(shutdownSyncTimeout)
 		if err := store.Open(ctx); err != nil {
 			return nil, fmt.Errorf("s3lite: litestream open: %w", err)
 		}
@@ -173,17 +193,39 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	return db, nil
 }
 
-// Close flushes pending replication, stops litestream, and closes the database.
+// Close durably flushes pending replication, stops litestream, and closes the
+// database. On a replicated DB (BackupTo set) it guarantees the replica reflects
+// all committed writes before returning — callers do not need a separate Sync.
+// The flush is bounded by Config.ShutdownSyncTimeout (default 30s): if the
+// replica cannot be reached in time, Close returns an error rather than hanging.
+// With no replica configured it is a fast no-op beyond closing the DB.
 // Returns the first non-nil error encountered.
 func (db *DB) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), db.shutdownSyncTimeout)
+	defer cancel()
+	return db.CloseContext(ctx)
+}
+
+// CloseContext is like Close but bounds the final durable flush by ctx instead
+// of Config.ShutdownSyncTimeout. Use it to wire Close into an existing
+// graceful-shutdown deadline. The database handle is always closed even if the
+// flush errors or ctx expires.
+func (db *DB) CloseContext(ctx context.Context) error {
 	var firstErr error
 	save := func(err error) {
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	// Flush while the WAL is still intact: closing the sql handle can checkpoint
+	// and truncate the WAL, and litestream captures writes from WAL frames. The
+	// explicit SyncAndWait guarantees the committed state reaches the replica
+	// before teardown, bounded by ctx so an unreachable replica cannot hang Close.
+	if db.lsDB != nil {
+		save(db.lsDB.SyncAndWait(ctx))
+	}
 	save(db.DB.Close())
-	save(db.closeReplication(context.Background()))
+	save(db.closeReplication(ctx))
 	return firstErr
 }
 
