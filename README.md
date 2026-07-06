@@ -2,6 +2,8 @@
 
 **A real database for serverless apps that idle to zero — backed by nothing but an object-store bucket.**
 
+*Built for the developer who just wants to deploy their own thing: managed-grade durability at near-zero cost, with no database to babysit and no "which instance is the writer" incident to debug.*
+
 s3lite wraps [litestream](https://litestream.io) and a CGO-free SQLite driver so a plain container uses SQLite as a managed database: restore from S3 on startup, replicate to S3 continuously, and — via a lease built on the object store's own atomic conditional write — keep exactly one writer safe across restarts, deploys, and failover with no other moving parts. You get a standard `*sql.DB`.
 
 ## What it enables
