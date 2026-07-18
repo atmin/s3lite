@@ -43,9 +43,9 @@ writer role.
 - It reuses primitives that already exist: the lease CAS, the renew loop, and
   `Close`'s clean-release path. The only new state is one marker object and a
   min/max hold policy.
-- It composes cleanly with on-demand promotion ([../tasks/trypromote.md](../tasks/trypromote.md))
-  and continuous follower refresh ([../tasks/followerrefresh.md](../tasks/followerrefresh.md)):
-  a waiter that is already refreshed promotes fast, and yield gives it the token.
+- It composes cleanly with on-demand promotion (`TryPromote`) and continuous
+  follower refresh (`FollowerRefreshInterval`), both shipped: a waiter that is
+  already refreshed promotes fast, and yield gives it the token.
 
 ## Why it's parked (not a task)
 

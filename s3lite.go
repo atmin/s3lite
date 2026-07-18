@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/superfly/ltx"
 	_ "modernc.org/sqlite"
 )
 
@@ -85,6 +86,18 @@ type Config struct {
 	// Owner is the lease owner id recorded in the lock file for diagnostics. When
 	// empty, litestream generates one (hostname:pid). Ignored without an s3:// BackupTo.
 	Owner string
+
+	// FollowerRefreshInterval, when > 0, makes a follower periodically restore the
+	// leader's latest committed state from BackupTo and serve it read-only, giving
+	// near-live reads with staleness bounded by roughly this interval plus the
+	// leader's replication lag. When 0 (the default) a follower serves the snapshot
+	// it restored at Open and refreshes only on promotion — bit-identical to prior
+	// behaviour. Ignored without an s3:// BackupTo (nothing to follow) and while
+	// this instance is the writer. Best-effort: a failed refresh is logged and the
+	// follower keeps serving its current state. A refresh that lands new data swaps
+	// the local file underneath the stable handle, so an in-flight read spanning the
+	// swap may see a rare, retryable error; ticks find nothing new do no swap.
+	FollowerRefreshInterval time.Duration
 }
 
 // Role selects how an instance coordinates single-writer access to an s3://
@@ -179,6 +192,13 @@ type DB struct {
 
 	onPromote func()
 	onDemote  func(error)
+	onRefresh func()
+
+	// lastRefreshPos is the replica TXID the follower last restored to. It gates
+	// no-op follower refreshes (skip the swap when the replica has not advanced).
+	// Accessed only from the leaseLoop goroutine (seeded at Open before the loop
+	// starts), so it needs no lock.
+	lastRefreshPos ltx.TXID
 
 	loopCancel context.CancelFunc
 	wg         sync.WaitGroup
@@ -290,6 +310,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 				if oerr := db.openFollowerLocked(ctx); oerr != nil {
 					return nil, oerr
 				}
+				db.seedRefreshPos(ctx)
 				db.startLeaseLoop()
 				return db, nil
 			}
@@ -306,6 +327,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		if err := db.openFollowerLocked(ctx); err != nil {
 			return nil, err
 		}
+		db.seedRefreshPos(ctx)
 		db.startLeaseLoop()
 		return db, nil
 
@@ -530,6 +552,17 @@ func (db *DB) OnDemote(fn func(error)) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.onDemote = fn
+}
+
+// OnRefresh registers a callback fired after a follower refresh swaps in newer
+// state from the replica (see Config.FollowerRefreshInterval), e.g. to bust caches
+// built on the previous snapshot. It never fires for a writer or when a tick finds
+// nothing new. It must not call Close and should return quickly. Set it before
+// Open returns control to other goroutines.
+func (db *DB) OnRefresh(fn func()) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.onRefresh = fn
 }
 
 // Sync blocks until the replica is caught up with the current database state.

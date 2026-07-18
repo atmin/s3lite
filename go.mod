@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.95.0
 	github.com/benbjohnson/litestream v0.5.13
+	github.com/superfly/ltx v0.5.1
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	modernc.org/sqlite v1.44.3
 )
@@ -87,7 +88,6 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.3 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/superfly/ltx v0.5.1 // indirect
 	github.com/testcontainers/testcontainers-go v0.42.0 // indirect
 	github.com/tetratelabs/wazero v1.2.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect

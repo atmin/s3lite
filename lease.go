@@ -139,7 +139,11 @@ func (db *DB) startLeaseLoop() {
 
 // leaseLoop is the single goroutine that drives lease state. As leader it renews
 // at TTL/3 and demotes on any renew failure (fencing); as follower it polls to
-// acquire the lease and promotes on success. It exits when ctx is cancelled.
+// acquire the lease and promotes on success, and — when FollowerRefreshInterval is
+// set — refreshes its read-only snapshot on that separate cadence. Keeping renew,
+// promote, and refresh in one goroutine means they never run concurrently within an
+// instance; promoteMu additionally guards refresh/promote against TryPromote
+// callers. It exits when ctx is cancelled.
 func (db *DB) leaseLoop(ctx context.Context) {
 	defer db.wg.Done()
 
@@ -147,26 +151,38 @@ func (db *DB) leaseLoop(ctx context.Context) {
 	if interval <= 0 {
 		interval = time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	leaseTicker := time.NewTicker(interval)
+	defer leaseTicker.Stop()
+
+	// Optional follower-refresh ticker on its own cadence. When refresh is disabled
+	// refreshC stays nil, so its select case blocks forever and never fires.
+	var refreshC <-chan time.Time
+	if db.cfg.FollowerRefreshInterval > 0 {
+		refreshTicker := time.NewTicker(db.cfg.FollowerRefreshInterval)
+		defer refreshTicker.Stop()
+		refreshC = refreshTicker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-		}
+		case <-leaseTicker.C:
+			db.mu.Lock()
+			leader := db.isLeader
+			db.mu.Unlock()
 
-		db.mu.Lock()
-		leader := db.isLeader
-		db.mu.Unlock()
-
-		if leader {
-			if err := db.tryRenew(ctx); err != nil {
-				db.demote(err)
+			if leader {
+				if err := db.tryRenew(ctx); err != nil {
+					db.demote(err)
+				}
+			} else {
+				db.tryPromote(ctx)
 			}
-		} else {
-			db.tryPromote(ctx)
+		case <-refreshC:
+			if err := db.refreshFollowerOnce(ctx); err != nil && ctx.Err() == nil {
+				db.logger.Warn("s3lite: follower refresh failed", "error", err)
+			}
 		}
 	}
 }
@@ -277,6 +293,70 @@ func (db *DB) isClosing() bool {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.closed
+}
+
+// seedRefreshPos records the replica position a follower restored to at Open, so
+// the first refresh tick is a no-op unless the replica has since advanced. Called
+// once during Open (before the loop starts) when follower refresh is enabled;
+// best-effort — a probe failure just means the first tick does one redundant
+// restore.
+func (db *DB) seedRefreshPos(ctx context.Context) {
+	if db.cfg.FollowerRefreshInterval <= 0 || db.leaser == nil {
+		return
+	}
+	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	if err != nil {
+		db.logger.Warn("s3lite: seeding follower refresh position failed; first refresh may be redundant", "error", err)
+		return
+	}
+	db.lastRefreshPos = pos
+}
+
+// refreshFollowerOnce restores a follower to the replica's latest committed state
+// and swaps it in read-only, so the follower serves near-live reads. It is a no-op
+// on the writer and when the replica has not advanced since the last refresh. It
+// shares promoteMu with promotion so a refresh and a promote can never both rebuild
+// the local file at once. Called only from leaseLoop.
+func (db *DB) refreshFollowerOnce(ctx context.Context) error {
+	if db.IsLeader() { // writers own the latest state; never self-refresh
+		return nil
+	}
+	db.promoteMu.Lock()
+	defer db.promoteMu.Unlock()
+	if db.IsLeader() { // recheck: a concurrent promote may have won
+		return nil
+	}
+
+	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	if err != nil {
+		return err
+	}
+	if pos <= db.lastRefreshPos {
+		return nil // replica unchanged since our last restore — no swap
+	}
+
+	swapErr := db.connector.swapFiles(true, func() error { // stays read-only
+		if err := removeLocalDBFiles(db.cfg.LocalPath); err != nil {
+			return fmt.Errorf("s3lite: refresh: clear local files: %w", err)
+		}
+		if err := restoreDB(ctx, db.cfg.S3, db.cfg.BackupTo, db.cfg.LocalPath); err != nil {
+			return fmt.Errorf("s3lite: refresh: restore: %w", err)
+		}
+		return precreateWAL(ctx, db.cfg.LocalPath)
+	})
+	if swapErr != nil {
+		return swapErr
+	}
+	db.lastRefreshPos = pos
+
+	db.mu.Lock()
+	onRefresh := db.onRefresh
+	db.mu.Unlock()
+	db.logger.Info("s3lite: follower refreshed", "txid", pos)
+	if onRefresh != nil {
+		onRefresh()
+	}
+	return nil
 }
 
 // promote turns a follower into the writer: it restores the replica's latest

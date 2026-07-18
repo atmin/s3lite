@@ -165,9 +165,17 @@ acquisition is the same lease CAS the loop uses — and is safe to call
 concurrently. It is strictly additive: an instance that never calls it is
 unchanged.
 
-Followers serve the snapshot they restored at `Open` and refresh on **promotion**
-(a follower restores the latest state before it starts writing); continuous
-follower refresh is not yet implemented.
+Followers serve the snapshot they restored at `Open` and always refresh on
+**promotion** (a follower restores the latest state before it starts writing). To
+also serve **near-live reads**, set `Config.FollowerRefreshInterval`: the follower
+then periodically restores the leader's latest committed state and swaps it in
+read-only, with staleness bounded by roughly the interval plus the leader's
+replication lag. A tick that finds nothing new does no work, so idle followers are
+cheap; register `OnRefresh` to bust caches when new state lands. Left at zero (the
+default) a follower serves only its `Open` snapshot — unchanged behaviour. The
+refresh replaces the local file underneath the stable handle, so a read that is
+in flight at the swap may see a rare, retryable error (the connection is dropped
+and re-dialed); keep the interval modest and retry.
 
 The embedded `*sql.DB` is **stable for the life of the instance** — it is created
 once and never reassigned, even across promote/demote. Take it once
@@ -189,8 +197,9 @@ blank and rely on the instance role.
 - Single writer per replica. Enforce it yourself (one instance) or let s3lite
   enforce it with a lease — see [Single writer + read followers](#single-writer--read-followers-leasing).
 - Restore happens on Open — cold starts pay this cost, proportional to DB size (sub-second for small DBs, longer for multi-GB). Keep one instance warm if a large-DB restore would hurt first-request latency.
-- Followers serve their Open-time snapshot and only refresh on promotion;
-  continuous follower refresh is not yet implemented.
+- Followers serve their Open-time snapshot and only refresh on promotion unless
+  `FollowerRefreshInterval` is set, which gives bounded-staleness near-live reads
+  by periodically restoring the latest state (not incremental WAL tailing yet).
 - A clean `Close` is durable: it flushes all committed writes to the replica
   before returning (bounded by `Config.ShutdownSyncTimeout`, default 30s). Only a
   *hard* crash/kill can lose the sub-second window since litestream's last sync.

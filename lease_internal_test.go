@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/superfly/ltx"
 )
 
 // fakeLock is an in-memory model of a single lease lock with the same CAS
@@ -877,6 +878,391 @@ func TestTryPromoteAfterCloseReturnsErrClosed(t *testing.T) {
 	if db.IsLeader() {
 		t.Fatal("a closed instance must not become leader")
 	}
+}
+
+func TestFollowerRefreshSeesNewWrites(t *testing.T) {
+	// A follower with FollowerRefreshInterval set picks up writes the leader makes
+	// after the follower opened, on the stable handle, without becoming writable.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if err := db1.Sync(ctx); err != nil { // publish the schema to the replica
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if db2.IsLeader() {
+		t.Fatal("db2 should be a follower")
+	}
+	cached := db2.DB
+
+	// A new row on the leader, published to the replica after the follower opened.
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('fresh')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+			return false
+		}
+		return n == 1
+	}, "follower to refresh to the new row")
+
+	if cached != db2.DB {
+		t.Fatal("refresh must not replace the stable handle")
+	}
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('nope')`); err == nil {
+		t.Fatal("a refreshed follower handle must stay read-only")
+	}
+}
+
+func TestFollowerRefreshNoOpWhenUnchanged(t *testing.T) {
+	// An idle replica must produce zero swaps: OnRefresh never fires while the
+	// leader is quiet, so followers do not churn connections on every tick.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	var refreshes atomic.Int64
+	db2.OnRefresh(func() { refreshes.Add(1) })
+
+	time.Sleep(400 * time.Millisecond) // several refresh intervals, leader quiet
+
+	if got := refreshes.Load(); got != 0 {
+		t.Fatalf("idle follower must not swap; OnRefresh fired %d times", got)
+	}
+}
+
+func TestFollowerRefreshDisabledByDefault(t *testing.T) {
+	// With FollowerRefreshInterval unset (0), a follower serves its Open-time
+	// snapshot and never picks up later writes — bit-identical to prior behaviour.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+		// FollowerRefreshInterval intentionally unset (0).
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	// The follower restored the seed row at Open.
+	var n int
+	if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("follower should serve the Open snapshot (1 row), got %d", n)
+	}
+
+	// A later write must NOT reach the follower — refresh is off.
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('second')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("refresh is disabled; follower must still see only 1 row, got %d", n)
+	}
+}
+
+func TestFollowerRefreshDoesNotClobberPromotion(t *testing.T) {
+	// Refresh ticks and (external) TryPromote calls both serialise on promoteMu, so
+	// a promotion racing refresh yields exactly one becomeLeaderLocked and a
+	// writable, up-to-date handle. Run under -race.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 80 * time.Millisecond
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('x')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                ttl,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	var promotes atomic.Int64
+	db2.OnPromote(func() { promotes.Add(1) })
+
+	// Free the lease; db2's loop promotes while refresh ticks and external
+	// TryPromote calls contend for promoteMu.
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_, _ = db2.TryPromote(ctx)
+			}
+		}()
+	}
+	wg.Wait()
+
+	waitFor(t, 3*time.Second, db2.IsLeader, "follower to promote")
+	if got := promotes.Load(); got != 1 {
+		t.Fatalf("expected exactly one promotion across refresh + promote, got %d", got)
+	}
+	var name string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatalf("promoted follower cannot read: %v", err)
+	}
+	if _, err := db2.ExecContext(ctx, `INSERT INTO items (name) VALUES ('y')`); err != nil {
+		t.Fatalf("promoted follower cannot write: %v", err)
+	}
+}
+
+func TestFollowerRefreshErrorIsNonFatal(t *testing.T) {
+	// A refresh whose replica probe fails must be logged and shrugged off: the
+	// follower keeps serving its current state and does not promote. The probe is
+	// injected to fail so the test stays fast and deterministic (no real backend).
+	lock := &fakeLock{}
+	lock.steal("other-instance", time.Minute) // held elsewhere: no promotion
+	installFakeLeaser(t, lock)
+
+	prev := replicaLatestTXIDFunc
+	replicaLatestTXIDFunc = func(context.Context, S3Config, string) (ltx.TXID, error) {
+		return 0, errors.New("probe boom")
+	}
+	t.Cleanup(func() { replicaLatestTXIDFunc = prev })
+
+	ctx := context.Background()
+	db, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                "file://" + t.TempDir(),
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	time.Sleep(200 * time.Millisecond) // let several refresh ticks fail
+
+	if db.IsLeader() {
+		t.Fatal("a follower must not promote when refresh fails")
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("follower must keep serving despite refresh failures: %v", err)
+	}
+}
+
+func TestFollowerRefreshConcurrentReadsSurviveSwap(t *testing.T) {
+	// Reads on the cached handle across refresh swaps may fail transiently but must
+	// never go backwards (torn read) and must converge to the full state. Run under
+	// -race.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var last int
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var n int
+				if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+					continue // a transient error at a swap boundary is acceptable
+				}
+				if n < last {
+					t.Errorf("row count went backwards across a swap: %d < %d", n, last)
+					return
+				}
+				last = n
+			}
+		}()
+	}
+
+	const batches = 10
+	for i := 0; i < batches; i++ {
+		if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('r')`); err != nil {
+			t.Error(err)
+			break
+		}
+		if err := db1.Sync(ctx); err != nil {
+			t.Error(err)
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+			return false
+		}
+		return n == batches
+	}, "follower to converge to all rows")
+
+	close(stop)
+	wg.Wait()
 }
 
 func TestLeaseLossDemotesWriter(t *testing.T) {
