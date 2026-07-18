@@ -124,6 +124,10 @@ const DefaultShutdownSyncTimeout = 30 * time.Second
 // It matches litestream's s3.DefaultLeaseTTL.
 const DefaultLeaseTTL = 30 * time.Second
 
+// ErrClosed is returned by TryPromote when the instance is closing, so a
+// promotion racing Close cannot resurrect a torn-down instance.
+var ErrClosed = errors.New("s3lite: instance is closed")
+
 // S3Config holds S3 connection settings. Callers are responsible for sourcing
 // these values (e.g. from environment variables).
 type S3Config struct {
@@ -165,6 +169,13 @@ type DB struct {
 	mu       sync.Mutex
 	lease    *litestream.Lease
 	isLeader bool
+	closed   bool // set by Close under mu; blocks a late promotion from resurrecting a torn-down instance
+
+	// promoteMu serialises promotion attempts (the background leaseLoop and every
+	// TryPromote caller) across the whole acquire+restore, so at most one runs at a
+	// time. It is deliberately separate from mu: the restore is slow and must not
+	// block IsLeader / Generation / tryRenew for its duration.
+	promoteMu sync.Mutex
 
 	onPromote func()
 	onDemote  func(error)
@@ -431,6 +442,11 @@ func (db *DB) CloseContext(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Mark closed under mu before teardown: a TryPromote that is mid-restore will
+	// see this when it reaches its own mu section (promote) and abort rather than
+	// bring replication back up on a torn-down instance.
+	db.closed = true
+
 	var firstErr error
 	save := func(err error) {
 		if err != nil && firstErr == nil {
@@ -468,6 +484,21 @@ func (db *DB) IsLeader() bool {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.isLeader
+}
+
+// TryPromote attempts to acquire the writer lease immediately rather than waiting
+// for the next background poll. It returns true if this instance is (or, after
+// restoring the latest replica, has just become) the writer, and false if the
+// lease is still held by a live writer elsewhere. On a follower it blocks for the
+// restore while promoting; bound ctx to cap that wait.
+//
+// It never promotes two writers — acquisition is the same lease CAS the background
+// loop uses, so this makes promotion happen sooner, never more often. An unleased
+// sole writer (no s3:// BackupTo) is always the writer, so this returns true
+// without any I/O. Safe to call concurrently. Once Close has begun it returns
+// ErrClosed; callers should stop calling TryPromote when they start shutting down.
+func (db *DB) TryPromote(ctx context.Context) (bool, error) {
+	return db.tryPromoteOnce(ctx)
 }
 
 // Generation returns the lease generation — a monotonic fencing token bumped on

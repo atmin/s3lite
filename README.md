@@ -142,6 +142,29 @@ The holder renews at `LeaseTTL/3` (default TTL 30s); a holder that cannot renew
 so two writers never overlap. `Close` releases the lease so a successor takes over
 at once instead of waiting out the TTL.
 
+A follower normally promotes only when the background loop next polls (every
+`LeaseTTL/3`). To skip that wait, a consumer can call `TryPromote` on the write
+path so a request that arrives during a handoff blocks for the restore and then
+serves, instead of being refused until the next poll:
+
+```go
+if !db.IsLeader() {
+    if ok, err := db.TryPromote(ctx); err != nil || !ok {
+        http.Error(w, "no writer available", http.StatusServiceUnavailable)
+        return
+    }
+}
+// now the writer — safe to write
+```
+
+`TryPromote` attempts to acquire the lease immediately: it returns `true` if this
+instance is (or, after restoring the latest replica, has just become) the writer,
+and `false` if the lease is still held by a live writer elsewhere (e.g. after a
+hard kill, until the old lease expires). It never promotes two writers —
+acquisition is the same lease CAS the loop uses — and is safe to call
+concurrently. It is strictly additive: an instance that never calls it is
+unchanged.
+
 Followers serve the snapshot they restored at `Open` and refresh on **promotion**
 (a follower restores the latest state before it starts writing); continuous
 follower refresh is not yet implemented.

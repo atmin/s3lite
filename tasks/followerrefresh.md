@@ -23,7 +23,7 @@ feature and touches nothing about write coordination.
 
 It is also the enabler for on-demand promotion: a follower that is already caught
 up promotes in ~lease-acquire latency instead of paying a full cold restore — so
-this composes directly with [trypromote.md](trypromote.md).
+this composes directly with `TryPromote` (shipped).
 
 ## Background — the machinery already exists
 
@@ -97,7 +97,7 @@ drop the limitation), plus tests.
        if db.IsLeader() {
            return nil // writers never self-refresh; they own the latest state
        }
-       db.promoteMu.Lock()         // shared with tryPromoteOnce — see trypromote.md
+       db.promoteMu.Lock()         // shared with tryPromoteOnce (already in lease.go)
        defer db.promoteMu.Unlock()
        if db.IsLeader() {          // recheck: a concurrent promote may have won
            return nil
@@ -129,8 +129,8 @@ drop the limitation), plus tests.
      (generation + max txid, via the same client `newReplicaClient` builds) and
      compares to `db.lastRefreshPos`. Seed `lastRefreshPos` from the `Open`-time
      restore so the first tick after `Open` is a no-op when nothing has changed.
-   - Depends on the `promoteMu` guard from [trypromote.md](trypromote.md). If this
-     lands first, introduce `promoteMu` here and have trypromote reuse it.
+   - Reuses the `promoteMu` guard already added for `TryPromote`
+     ([lease.go](../lease.go) `tryPromoteOnce`).
 
 3. **Loop wiring** (lease.go `leaseLoop` follower branch): drive the refresh on its
    own cadence, independent of the promote/renew tick. Simplest: track

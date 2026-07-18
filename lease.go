@@ -225,22 +225,58 @@ func (db *DB) demote(cause error) {
 	}
 }
 
-// tryPromote attempts to acquire the lease while a follower. On success it
-// promotes to writer; a lease still held by the leader is the normal no-op.
+// tryPromote is the background leaseLoop's follower-branch promotion attempt. It
+// routes through tryPromoteOnce (the shared, guarded path) and preserves the loop's
+// "log and move on" behaviour: a lease still held elsewhere is a silent no-op, and
+// errors during shutdown (cancelled ctx) are not logged.
 func (db *DB) tryPromote(ctx context.Context) {
+	if _, err := db.tryPromoteOnce(ctx); err != nil && ctx.Err() == nil {
+		db.logger.Warn("s3lite: promotion attempt failed", "error", err)
+	}
+}
+
+// tryPromoteOnce is the single guarded promotion path shared by the background
+// leaseLoop and the public TryPromote. It holds promoteMu across the whole
+// acquire+restore so concurrent callers cannot both restore and both reach
+// becomeLeaderLocked. It returns true when this instance is (or has just become)
+// the writer, and false with a nil error when the lease is still held elsewhere.
+func (db *DB) tryPromoteOnce(ctx context.Context) (bool, error) {
+	if db.IsLeader() { // fast path: no S3 I/O, no lock contention
+		return true, nil
+	}
+	db.promoteMu.Lock()
+	defer db.promoteMu.Unlock()
+	if db.IsLeader() { // recheck: the loop (or another caller) may have promoted us
+		return true, nil
+	}
+	if db.isClosing() { // do not resurrect an instance that is shutting down
+		return false, ErrClosed
+	}
 	lease, err := db.leaser.AcquireLease(ctx)
 	if err != nil {
 		var held *litestream.LeaseExistsError
-		if errors.As(err, &held) || ctx.Err() != nil {
-			return // still held, or shutting down
+		if errors.As(err, &held) {
+			// Still held by a live writer elsewhere (or by us, if the loop just
+			// promoted — covered by the recheck above). Normal no-op.
+			return db.IsLeader(), nil
 		}
-		db.logger.Warn("s3lite: lease acquire attempt failed", "error", err)
-		return
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
 	}
 	if err := db.promote(ctx, lease); err != nil {
-		db.logger.Warn("s3lite: promotion failed, releasing lease", "error", err)
 		db.releaseQuietly(ctx, lease)
+		return false, err
 	}
+	return true, nil
+}
+
+// isClosing reports whether Close has begun tearing the instance down.
+func (db *DB) isClosing() bool {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.closed
 }
 
 // promote turns a follower into the writer: it restores the replica's latest
@@ -276,6 +312,12 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 	}
 
 	db.mu.Lock()
+	if db.closed {
+		// Close ran while we were restoring; do not bring replication back up.
+		db.connector.setMode(true)
+		db.mu.Unlock()
+		return ErrClosed
+	}
 	if err := db.becomeLeaderLocked(ctx, lease); err != nil {
 		db.connector.setMode(true) // remain a read-only follower
 		db.mu.Unlock()

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,16 +88,24 @@ func cloneLease(l *litestream.Lease) *litestream.Lease {
 }
 
 type fakeLeaser struct {
-	lock  *fakeLock
-	owner string
-	ttl   time.Duration
+	lock     *fakeLock
+	owner    string
+	ttl      time.Duration
+	acquireN atomic.Int64 // number of AcquireLease attempts that reached the lock
 }
 
 func (f *fakeLeaser) Type() string { return "fake" }
 func (f *fakeLeaser) AcquireLease(ctx context.Context) (*litestream.Lease, error) {
+	if err := ctx.Err(); err != nil { // mirror the real leaser: acquisition does I/O
+		return nil, err
+	}
+	f.acquireN.Add(1)
 	return f.lock.acquire(f.owner, f.ttl)
 }
 func (f *fakeLeaser) RenewLease(ctx context.Context, l *litestream.Lease) (*litestream.Lease, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return f.lock.renew(l, f.owner, f.ttl)
 }
 func (f *fakeLeaser) ReleaseLease(ctx context.Context, l *litestream.Lease) error {
@@ -557,6 +566,316 @@ func TestCachedHandleFencedOnDemote(t *testing.T) {
 	}
 	if err := cached.PingContext(ctx); err != nil {
 		t.Fatalf("demoted handle should still serve reads: %v", err)
+	}
+}
+
+func TestTryPromoteConcurrentSingleFlight(t *testing.T) {
+	// N concurrent TryPromote calls on a follower whose lease is free must produce
+	// exactly one restore/promote (single-flight under promoteMu) and all return
+	// (true, nil). A long TTL keeps the background loop from ticking, so every
+	// promotion here comes from TryPromote.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.IsLeader() {
+		t.Fatal("db should start as a follower")
+	}
+
+	var promotes atomic.Int64
+	db.OnPromote(func() { promotes.Add(1) })
+
+	const n = 16
+	results := make([]bool, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = db.TryPromote(ctx)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Errorf("goroutine %d: unexpected error %v", i, errs[i])
+		}
+		if !results[i] {
+			t.Errorf("goroutine %d: TryPromote returned false, want true", i)
+		}
+	}
+	if got := promotes.Load(); got != 1 {
+		t.Fatalf("expected exactly one promotion under concurrency, got %d", got)
+	}
+	if !db.IsLeader() {
+		t.Fatal("db should be leader after TryPromote")
+	}
+}
+
+func TestTryPromoteStillHeldReturnsFalse(t *testing.T) {
+	// A lease held by a live writer elsewhere makes TryPromote a no-op: (false, nil),
+	// and the instance stays a read-only follower.
+	lock := &fakeLock{}
+	lock.steal("other-instance", time.Minute)
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ok, err := db.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ok {
+		t.Fatal("TryPromote should return false while the lease is held elsewhere")
+	}
+	if db.IsLeader() {
+		t.Fatal("instance must stay a follower")
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE x (i INTEGER)`); err == nil {
+		t.Fatal("follower handle must reject writes (query_only)")
+	}
+}
+
+func TestTryPromoteAlreadyLeaderDoesNoIO(t *testing.T) {
+	// On the writer, TryPromote is a pure fast-path getter: no AcquireLease call.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "writer",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if !db.IsLeader() {
+		t.Fatal("writer should be leader")
+	}
+
+	fl := db.leaser.(*fakeLeaser)
+	before := fl.acquireN.Load()
+	ok, err := db.TryPromote(ctx)
+	if err != nil || !ok {
+		t.Fatalf("TryPromote on leader: ok=%v err=%v, want true/nil", ok, err)
+	}
+	if got := fl.acquireN.Load() - before; got != 0 {
+		t.Fatalf("TryPromote on the leader must do no AcquireLease, got %d", got)
+	}
+}
+
+func TestTryPromoteSoleWriter(t *testing.T) {
+	// With no s3:// BackupTo there is no leaser; the sole writer is always the
+	// writer, so TryPromote returns (true, nil) immediately without touching one.
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.leaser != nil {
+		t.Fatal("a non-s3 BackupTo must not build a leaser")
+	}
+
+	ok, err := db.TryPromote(ctx)
+	if err != nil || !ok {
+		t.Fatalf("sole writer TryPromote: ok=%v err=%v, want true/nil", ok, err)
+	}
+}
+
+func TestTryPromotePromotedHandleIsFreshAndWritable(t *testing.T) {
+	// After a TryPromote that actually promotes, the handle sees the previous
+	// writer's latest state (restored) and accepts writes.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('before')`); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	// Release the leader so the lease is free, then promote on demand.
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := db2.TryPromote(ctx)
+	if err != nil || !ok {
+		t.Fatalf("TryPromote after release: ok=%v err=%v, want true/nil", ok, err)
+	}
+
+	var name string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatalf("promoted handle cannot read restored row: %v", err)
+	}
+	if name != "before" {
+		t.Fatalf("expected before, got %q", name)
+	}
+	if _, err := db2.ExecContext(ctx, `INSERT INTO items (name) VALUES ('after')`); err != nil {
+		t.Fatalf("promoted handle cannot write: %v", err)
+	}
+}
+
+func TestTryPromoteRacesBackgroundLoop(t *testing.T) {
+	// A short TTL runs the background loop's own promotion attempts concurrently
+	// with a storm of TryPromote calls. There must be no double restore (exactly
+	// one promotion), the run must be -race clean, and the instance ends leader.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  60 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var promotes atomic.Int64
+	db.OnPromote(func() { promotes.Add(1) })
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				_, _ = db.TryPromote(ctx)
+			}
+		}()
+	}
+	wg.Wait()
+
+	waitFor(t, 2*time.Second, db.IsLeader, "instance to promote")
+	if got := promotes.Load(); got != 1 {
+		t.Fatalf("expected exactly one promotion across loop + TryPromote, got %d", got)
+	}
+}
+
+func TestTryPromoteContextCancelled(t *testing.T) {
+	// A cancelled ctx makes TryPromote return promptly with a non-nil error and
+	// leaves the instance a follower.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+
+	db, err := Open(context.Background(), Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ok, err := db.TryPromote(ctx)
+	if err == nil {
+		t.Fatal("cancelled ctx should return an error")
+	}
+	if ok {
+		t.Fatal("cancelled TryPromote must not report leadership")
+	}
+	if db.IsLeader() {
+		t.Fatal("instance must remain a follower")
+	}
+}
+
+func TestTryPromoteAfterCloseReturnsErrClosed(t *testing.T) {
+	// A TryPromote that begins after Close must not resurrect the instance.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err := db.TryPromote(ctx)
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed after Close, got ok=%v err=%v", ok, err)
+	}
+	if db.IsLeader() {
+		t.Fatal("a closed instance must not become leader")
 	}
 }
 
