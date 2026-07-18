@@ -136,14 +136,17 @@ type S3Config struct {
 // DB wraps *sql.DB with optional litestream replication.
 // All *sql.DB methods are available directly via embedding.
 //
-// Concurrency note for leased instances (s3:// BackupTo): the embedded *sql.DB is
-// stable for the whole lifetime of a writer, but a follower replaces it when it
-// promotes (it must reopen after restoring the latest state). Consumers running
-// RoleFollower/RoleAuto should therefore gate database access on IsLeader (or an
-// OnPromote/OnDemote callback) rather than caching the embedded handle across a
-// role change.
+// The embedded *sql.DB is stable for the whole life of the instance: it is
+// created once and never reassigned, even across lease promote/demote. Callers
+// may take it once (database := db.DB), hand it to repositories, and keep using
+// it — connections are transparently re-dialed against the current local file in
+// the current mode (writable as leader, read-only as follower). Use IsLeader or
+// OnPromote/OnDemote only to make decisions about role; you never need them to
+// keep a handle valid. A follower's handle rejects writes (query_only), so gate
+// write paths on IsLeader if you serve traffic before promotion.
 type DB struct {
 	*sql.DB
+	connector           *stableConnector
 	lsDB                *litestream.DB
 	store               *litestream.Store
 	shutdownSyncTimeout time.Duration
@@ -155,7 +158,11 @@ type DB struct {
 	leaseTTL time.Duration
 	leaser   litestream.Leaser
 
-	mu       sync.Mutex // guards DB, lsDB, store, lease, isLeader
+	// mu guards the lifecycle fields below and serialises role transitions. The
+	// embedded *sql.DB itself is stable once Open returns — it is created exactly
+	// once (via stableConnector) and never reassigned — so callers may cache and
+	// use it across promote/demote without locking.
+	mu       sync.Mutex
 	lease    *litestream.Lease
 	isLeader bool
 
@@ -349,62 +356,49 @@ func (db *DB) startReplicationLocked(ctx context.Context) error {
 	return nil
 }
 
-// openWriterLocked opens a writable sql handle, applies WAL pragmas, and runs
-// migrations. The caller must hold db.mu (or be in single-threaded Open).
-func (db *DB) openWriterLocked(ctx context.Context) error {
-	sqlDB, err := openSQL(ctx, db.cfg.LocalPath, false)
+// ensureHandleLocked creates the single stable *sql.DB the first time it is
+// needed. sql.OpenDB is lazy, so this is safe to call before the local file
+// exists. The caller must hold db.mu (or be in single-threaded Open).
+func (db *DB) ensureHandleLocked() error {
+	if db.connector != nil {
+		return nil
+	}
+	drv, err := sharedDriver()
 	if err != nil {
 		return err
 	}
+	db.connector = newStableConnector(drv, db.cfg.LocalPath, false)
+	db.DB = sql.OpenDB(db.connector)
+	return nil
+}
+
+// openWriterLocked puts the stable handle into read-write mode, runs migrations,
+// and verifies connectivity. On promote the local file has already been swapped
+// into place; here we only flip the mode and migrate. The caller must hold db.mu
+// (or be in single-threaded Open).
+func (db *DB) openWriterLocked(ctx context.Context) error {
+	if err := db.ensureHandleLocked(); err != nil {
+		return err
+	}
+	db.connector.setMode(false)
 	for i, m := range db.cfg.Migrations {
-		if _, err := sqlDB.ExecContext(ctx, m); err != nil {
-			sqlDB.Close()
+		if _, err := db.DB.ExecContext(ctx, m); err != nil {
 			return fmt.Errorf("s3lite: migration %d: %w", i, err)
 		}
 	}
-	db.DB = sqlDB
-	return nil
+	return db.DB.PingContext(ctx)
 }
 
-// openFollowerLocked opens a read-only sql handle without replication or
-// migrations. The caller must hold db.mu (or be in single-threaded Open).
+// openFollowerLocked puts the stable handle into read-only mode without
+// replication or migrations. The caller must hold db.mu (or be in single-threaded
+// Open).
 func (db *DB) openFollowerLocked(ctx context.Context) error {
-	sqlDB, err := openSQL(ctx, db.cfg.LocalPath, true)
-	if err != nil {
+	if err := db.ensureHandleLocked(); err != nil {
 		return err
 	}
-	db.DB = sqlDB
+	db.connector.setMode(true)
 	db.isLeader = false
-	return nil
-}
-
-// openSQL opens the SQLite file and applies connection pragmas. Read-only mode
-// pins query_only via the DSN so it applies to every pooled connection and skips
-// the WAL journal-mode write (a follower must not mutate the file).
-func openSQL(ctx context.Context, path string, readOnly bool) (*sql.DB, error) {
-	dsn := path
-	pragmas := []string{"PRAGMA busy_timeout=5000", "PRAGMA foreign_keys=ON"}
-	if readOnly {
-		dsn = path + "?_pragma=query_only(1)"
-	} else {
-		pragmas = append([]string{"PRAGMA journal_mode=WAL"}, pragmas...)
-	}
-
-	sqlDB, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
-	for _, pragma := range pragmas {
-		if _, err := sqlDB.ExecContext(ctx, pragma); err != nil {
-			sqlDB.Close()
-			return nil, err
-		}
-	}
-	if err := sqlDB.PingContext(ctx); err != nil {
-		sqlDB.Close()
-		return nil, err
-	}
-	return sqlDB, nil
+	return db.DB.PingContext(ctx)
 }
 
 // Close durably flushes pending replication, stops litestream, and closes the

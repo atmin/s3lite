@@ -366,6 +366,200 @@ func TestHandoffOnClosePromotesFollower(t *testing.T) {
 	}
 }
 
+func TestCachedHandleSurvivesPromotion(t *testing.T) {
+	// Reproduces the production hazard: a caller grabs the *sql.DB once (the
+	// obvious `database := s3db.DB`, then hands it to repositories) and reuses
+	// that exact handle. It must keep working across a promote even though promote
+	// rebuilds the local file underneath — the handle identity never changes and
+	// the pool transparently re-dials the restored, now-writable database.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 300 * time.Millisecond
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleAuto,
+		Owner:      "leader",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  replicaDir,
+		Role:      RoleAuto,
+		Owner:     "follower",
+		LeaseTTL:  ttl,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if db2.IsLeader() {
+		t.Fatal("db2 should be a follower while db1 holds the lease")
+	}
+
+	// Capture the concrete handle exactly as an application would, before any role
+	// change. Everything below uses this pointer, never db2.DB.
+	cached := db2.DB
+	if err := cached.PingContext(ctx); err != nil {
+		t.Fatalf("cached follower handle unusable: %v", err)
+	}
+	// A follower handle is read-only.
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('nope')`); err == nil {
+		t.Fatal("expected write on a read-only follower to fail")
+	}
+
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('handoff')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(); err != nil { // durable flush + lease release
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, db2.IsLeader, "follower to promote")
+
+	// The SAME cached handle must now see the replicated row and accept writes.
+	var name string
+	if err := cached.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatalf("cached handle cannot read replicated row after promote: %v", err)
+	}
+	if name != "handoff" {
+		t.Fatalf("expected handoff, got %q", name)
+	}
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('after-promote')`); err != nil {
+		t.Fatalf("cached handle cannot write after promote: %v", err)
+	}
+	if cached != db2.DB {
+		t.Fatal("handle identity changed across promote; callers that cached it would break")
+	}
+}
+
+func TestCachedHandleConcurrentReadsAcrossPromotion(t *testing.T) {
+	// Hammer the cached handle with concurrent reads while a promote rebuilds the
+	// file underneath. Reads may fail transiently during the swap (downtime is
+	// acceptable), but the connector must never race, never wedge the handle, and
+	// must recover to steady success once promotion completes.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 300 * time.Millisecond
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleAuto,
+		Owner:      "leader",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('seed')`); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  replicaDir,
+		Role:      RoleAuto,
+		Owner:     "follower",
+		LeaseTTL:  ttl,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				var n int
+				_ = cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n)
+			}
+		}()
+	}
+
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, db2.IsLeader, "follower to promote under load")
+	close(stop)
+	wg.Wait()
+
+	// After the storm settles, the same handle must read and write cleanly.
+	var n int
+	if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+		t.Fatalf("cached handle broken after concurrent promote: %v", err)
+	}
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('post')`); err != nil {
+		t.Fatalf("cached handle cannot write after concurrent promote: %v", err)
+	}
+}
+
+func TestCachedHandleFencedOnDemote(t *testing.T) {
+	// A writer that loses its lease must stop accepting writes on the exact handle
+	// the caller cached, without that handle being closed out from under them.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	ttl := 300 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "writer",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	cached := db.DB
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('while-leader')`); err != nil {
+		t.Fatalf("leader handle should accept writes: %v", err)
+	}
+
+	demoted := make(chan error, 1)
+	db.OnDemote(func(err error) { demoted <- err })
+	lock.steal("thief", time.Minute)
+
+	select {
+	case <-demoted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("writer did not demote after losing the lease")
+	}
+
+	// Same handle, now fenced: writes must be rejected, reads must still work.
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('after-demote')`); err == nil {
+		t.Fatal("demoted handle must reject writes")
+	}
+	if err := cached.PingContext(ctx); err != nil {
+		t.Fatalf("demoted handle should still serve reads: %v", err)
+	}
+}
+
 func TestLeaseLossDemotesWriter(t *testing.T) {
 	lock := &fakeLock{}
 	installFakeLeaser(t, lock)

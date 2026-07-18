@@ -214,6 +214,11 @@ func (db *DB) demote(cause error) {
 	db.stopReplicationLocked(canceledContext())
 	db.mu.Unlock()
 
+	// Fence the handle read-only so the demoted instance cannot keep writing to a
+	// lease it no longer holds. The stable *sql.DB is untouched; in-flight
+	// connections are rejected on next use and re-dialed query_only.
+	db.connector.setMode(true)
+
 	db.logger.Warn("s3lite: lease lost, stopped replicating", "error", cause)
 	if onDemote != nil {
 		onDemote(cause)
@@ -238,46 +243,41 @@ func (db *DB) tryPromote(ctx context.Context) {
 	}
 }
 
-// promote turns a follower into the writer: it reopens after restoring the
-// replica's latest state (the previous writer's final sync) and starts
-// replicating. The read-only handle is replaced, so RoleAuto/RoleFollower
-// consumers should react via OnPromote rather than caching the embedded *sql.DB.
+// promote turns a follower into the writer: it restores the replica's latest
+// state (the previous writer's final sync) and starts replicating. The stable
+// *sql.DB is not replaced — the connector re-dials the restored file writable
+// and drops the superseded read-only connections — so callers keep their handle.
 func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 	db.mu.Lock()
 	if db.isLeader {
 		db.mu.Unlock()
 		return nil
 	}
-	// Close the read-only handle before overwriting the file underneath it.
-	if db.DB != nil {
-		if err := db.DB.Close(); err != nil {
-			db.mu.Unlock()
-			return fmt.Errorf("s3lite: promote: close follower handle: %w", err)
-		}
-		db.DB = nil
-	}
 	db.mu.Unlock()
 
-	// Remove the stale follower files so litestream can restore fresh — Restore
-	// refuses to overwrite an existing output path.
-	if err := removeLocalDBFiles(db.cfg.LocalPath); err != nil {
-		db.reopenFollowerAfterFailedPromote()
-		return fmt.Errorf("s3lite: promote: clear local files: %w", err)
-	}
-
-	// Restore the latest committed state, then reopen writable and replicate.
-	if err := restoreDB(ctx, db.cfg.S3, db.cfg.BackupTo, db.cfg.LocalPath); err != nil {
-		db.reopenFollowerAfterFailedPromote()
-		return fmt.Errorf("s3lite: promote: restore: %w", err)
-	}
-	if err := precreateWAL(ctx, db.cfg.LocalPath); err != nil {
-		db.reopenFollowerAfterFailedPromote()
-		return err
+	// Rebuild the local file from the replica with connection creation gated, so
+	// no query observes a half-restored database, then flip the handle writable.
+	// The stable *sql.DB is never replaced: superseded follower connections are
+	// dropped from the pool automatically once the generation advances, and any
+	// handle a caller cached stays valid. Restore refuses to overwrite an existing
+	// output path, so the stale follower files are cleared first.
+	swapErr := db.connector.swapFiles(false, func() error {
+		if err := removeLocalDBFiles(db.cfg.LocalPath); err != nil {
+			return fmt.Errorf("s3lite: promote: clear local files: %w", err)
+		}
+		if err := restoreDB(ctx, db.cfg.S3, db.cfg.BackupTo, db.cfg.LocalPath); err != nil {
+			return fmt.Errorf("s3lite: promote: restore: %w", err)
+		}
+		return precreateWAL(ctx, db.cfg.LocalPath)
+	})
+	if swapErr != nil {
+		db.connector.setMode(true) // remain a read-only follower
+		return swapErr
 	}
 
 	db.mu.Lock()
 	if err := db.becomeLeaderLocked(ctx, lease); err != nil {
-		_ = db.openFollowerLocked(context.Background())
+		db.connector.setMode(true) // remain a read-only follower
 		db.mu.Unlock()
 		return err
 	}
@@ -290,17 +290,6 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 		onPromote()
 	}
 	return nil
-}
-
-// reopenFollowerAfterFailedPromote restores the read-only handle when a promotion
-// aborts midway, so the DB remains usable as a follower.
-func (db *DB) reopenFollowerAfterFailedPromote() {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.DB == nil {
-		// Best effort; if this fails the next promotion attempt will retry.
-		_ = db.openFollowerLocked(context.Background())
-	}
 }
 
 // releaseQuietly releases a lease we acquired but could not promote onto,

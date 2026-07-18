@@ -143,11 +143,16 @@ so two writers never overlap. `Close` releases the lease so a successor takes ov
 at once instead of waiting out the TTL.
 
 Followers serve the snapshot they restored at `Open` and refresh on **promotion**
-(a follower reopens after restoring the latest state before it starts writing);
-continuous follower refresh is not yet implemented. Consequently a follower
-replaces its embedded `*sql.DB` when it promotes — `RoleAuto`/`RoleFollower`
-consumers should gate access on `IsLeader`/`OnPromote` rather than caching the
-handle across a role change.
+(a follower restores the latest state before it starts writing); continuous
+follower refresh is not yet implemented.
+
+The embedded `*sql.DB` is **stable for the life of the instance** — it is created
+once and never reassigned, even across promote/demote. Take it once
+(`database := db.DB`), pass it to your repositories, and keep using it:
+connections are transparently re-dialed against the current file in the current
+mode. A follower's handle is read-only (`query_only`), so if you serve traffic
+before promotion, gate *write* paths on `IsLeader`; you never need `IsLeader` or
+`OnPromote` merely to keep a handle valid.
 
 ## Configuration
 
