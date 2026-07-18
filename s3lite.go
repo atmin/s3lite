@@ -41,9 +41,11 @@ type Config struct {
 	// S3-compatible providers — path-style addressing is enabled automatically.
 	S3 S3Config
 
-	// Logger receives litestream's log records. When nil, INFO is suppressed
-	// and WARN+ is written to stderr. Set to slog.Default() to mirror the
-	// host application's logging.
+	// Logger receives s3lite's own lifecycle events (promote/demote/restore) at
+	// their natural levels. litestream's internal logger is derived from this but
+	// gated to WARN+, so its per-interval "replica sync" INFO chatter is dropped
+	// while real replication problems still surface. When nil, a WARN+ stderr
+	// logger is used. Set to slog.Default() to mirror the host application.
 	Logger *slog.Logger
 
 	// ShutdownSyncTimeout bounds the final durable flush performed by Close on a
@@ -301,8 +303,11 @@ func (db *DB) startReplicationLocked(ctx context.Context) error {
 		{Level: 1, Interval: 10 * time.Second},
 	}
 	store := litestream.NewStore([]*litestream.DB{lsDB}, levels)
-	// NewStore resets db.Logger inside its constructor, so override after.
-	store.Logger = db.logger.With(litestream.LogKeySystem, litestream.LogSystemStore)
+	// NewStore resets db.Logger inside its constructor, so override after. Gate
+	// litestream to WARN+ so its per-interval "replica sync" INFO doesn't flood the
+	// application log; s3lite logs its own lifecycle events via db.logger directly.
+	lsLogger := litestreamLogger(db.logger)
+	store.Logger = lsLogger.With(litestream.LogKeySystem, litestream.LogSystemStore)
 	lsDB.SetLogger(store.Logger.With(litestream.LogKeyDB, filepath.Base(db.cfg.LocalPath)))
 	// Make store.Close perform a bounded, durable final sync so a clean Close
 	// flushes all committed writes. SetShutdownSyncTimeout propagates to lsDB.

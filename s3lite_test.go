@@ -243,7 +243,7 @@ func TestBackupToFileReplica(t *testing.T) {
 	}
 }
 
-func TestCustomLoggerReceivesLitestreamLogs(t *testing.T) {
+func TestCustomLoggerGatesLitestreamInfo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -272,9 +272,11 @@ func TestCustomLoggerReceivesLitestreamLogs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// litestream's per-interval "replica sync" INFO is gated to WARN+, so it must
+	// not reach the application log even though a real sync just ran.
 	out := buf.String()
-	if !strings.Contains(out, "replica sync") {
-		t.Fatalf("expected litestream logs in custom logger output; got:\n%s", out)
+	if strings.Contains(out, "replica sync") {
+		t.Fatalf("litestream INFO chatter leaked into the application log:\n%s", out)
 	}
 }
 
