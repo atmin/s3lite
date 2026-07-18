@@ -101,19 +101,19 @@ Point `RestoreFrom` and `BackupTo` at the same URL — restore what you've been 
 
 ## Single writer + read followers (leasing)
 
-litestream requires exactly one writer per replica. By default (`RoleOff`) s3lite
-does not enforce that — every instance with `BackupTo` set replicates as a
-writer, so you must guarantee a single instance yourself. Set `Config.Role` to
-have s3lite enforce single-writer by a **lease** (litestream's `s3.Leaser`, stored
-at `<BackupTo path>/lock.json`), so N instances run safely as one writer + many
-read-only followers:
+litestream requires exactly one writer per replica, and s3lite enforces that with
+a **lease** whenever it replicates to S3 — an `s3://` `BackupTo` is *always* leased
+(litestream's `s3.Leaser`, stored at `<BackupTo path>/lock.json`), so N instances
+run safely as one writer + many read-only followers. There is no uncoordinated
+"write to a shared WAL without a lease" mode. `Config.Role` only selects *how* an
+instance coordinates:
 
 ```go
 db, err := s3lite.Open(ctx, s3lite.Config{
     LocalPath: "/tmp/db.sqlite3",
-    BackupTo:  "s3://my-bucket/db", // leasing requires an s3:// replica
+    BackupTo:  "s3://my-bucket/db", // an s3:// replica is always leased
     S3:        s3cfg,
-    Role:      s3lite.RoleAuto, // acquire the lease if free, else follow
+    Role:      s3lite.RoleAuto, // the default: acquire the lease if free, else follow
     Migrations: []string{ /* ... */ },
 })
 ...
@@ -125,12 +125,17 @@ db.OnDemote(func(err error) { /* stop accepting writes now */ })
 ```
 
 Roles:
+- **`RoleAuto`** *(default)* — acquire if free (writer) else follow. The mode a
+  serverless consumer wants: safe rolling deploys (handoff by lease), writer
+  failover, and read scaling, all by construction. With no `s3://` replica (an
+  unreplicated or `file://` DB) it degrades to the sole writer.
 - **`RoleWriter`** — acquire the lease or fail `Open` with `*litestream.LeaseExistsError`.
 - **`RoleFollower`** — open read-only, never replicate; promote to writer if the
   lease becomes free.
-- **`RoleAuto`** — acquire if free (writer) else follow. The mode a serverless
-  consumer wants: safe rolling deploys (handoff by lease), writer failover, and
-  read scaling, all by construction.
+
+`RoleWriter` and `RoleFollower` demand a lease, so `Open` fails without an `s3://`
+`BackupTo`. Without an `s3://` replica there is no shared WAL to coordinate on, so
+the instance is simply the sole writer — leasing is neither needed nor possible.
 
 The holder renews at `LeaseTTL/3` (default TTL 30s); a holder that cannot renew
 **stops replicating immediately** (before the TTL could let anyone else acquire),

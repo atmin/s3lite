@@ -131,9 +131,9 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) 
 
 const itemsSchema = `CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`
 
-func TestRoleOffNeverLeases(t *testing.T) {
-	// A fake that fails loudly if consulted — RoleOff must not build a leaser.
-	installFakeLeaser(t, nil)
+func TestUnleasedFileBackupIsSoleWriter(t *testing.T) {
+	// A file:// replica has no conditional-write lease, so the real leaser rejects
+	// it and RoleAuto (the default) degrades to the sole writer — no leaser built.
 	ctx := context.Background()
 
 	db, err := Open(ctx, Config{
@@ -147,13 +147,73 @@ func TestRoleOffNeverLeases(t *testing.T) {
 	defer db.Close()
 
 	if !db.IsLeader() {
-		t.Fatal("RoleOff should always be leader (sole writer)")
+		t.Fatal("an unleased sole writer should always be leader")
 	}
 	if db.Generation() != 0 {
-		t.Fatalf("RoleOff should have no lease generation, got %d", db.Generation())
+		t.Fatalf("an unleased sole writer should have no lease generation, got %d", db.Generation())
 	}
 	if db.leaser != nil {
-		t.Fatal("RoleOff must not build a leaser")
+		t.Fatal("an unleased instance must not build a leaser")
+	}
+}
+
+func TestLeasedRoleRequiresS3Backup(t *testing.T) {
+	// RoleWriter and RoleFollower demand a lease, so a non-s3 BackupTo (which the
+	// real leaser rejects) is a config error rather than a silent uncoordinated writer.
+	ctx := context.Background()
+
+	for _, role := range []Role{RoleWriter, RoleFollower} {
+		_, err := Open(ctx, Config{
+			LocalPath: filepath.Join(t.TempDir(), "db.sqlite3"),
+			BackupTo:  "file://" + t.TempDir(),
+			Role:      role,
+		})
+		if err == nil {
+			t.Errorf("%s with a file:// BackupTo: Open succeeded, want an error", role)
+		}
+	}
+}
+
+func TestCloseBoundedOnUnreachableReplica(t *testing.T) {
+	// A leased writer whose s3 replica is unreachable must still Close within
+	// ShutdownSyncTimeout rather than hang on the final flush. A fake lease lets
+	// Open reach the writer state without real S3, and a precreated DB makes Open
+	// skip restore-from-replica — leaving only the replication endpoint dead.
+	installFakeLeaser(t, &fakeLock{})
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "db.sqlite3")
+	if err := precreateWAL(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(ctx, Config{
+		LocalPath:           path,
+		BackupTo:            "s3://s3lite-unreachable-bucket/prefix",
+		Role:                RoleWriter,
+		ShutdownSyncTimeout: 2 * time.Second,
+		S3: S3Config{
+			Region:          "us-east-1",
+			Endpoint:        "http://127.0.0.1:1", // nothing listening
+			AccessKeyID:     "x",
+			SecretAccessKey: "y",
+		},
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('x')`); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = db.Close()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected Close to error on unreachable replica")
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("Close did not honour ShutdownSyncTimeout; took %v", elapsed)
 	}
 }
 

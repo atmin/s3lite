@@ -403,42 +403,6 @@ func TestCloseIsDurableWithoutExplicitSync(t *testing.T) {
 	}
 }
 
-func TestCloseBoundedOnUnreachableReplica(t *testing.T) {
-	ctx := context.Background()
-
-	db, err := s3lite.Open(ctx, s3lite.Config{
-		LocalPath:           filepath.Join(t.TempDir(), "db.sqlite3"),
-		BackupTo:            "s3://s3lite-unreachable-bucket/prefix",
-		ShutdownSyncTimeout: 2 * time.Second,
-		S3: s3lite.S3Config{
-			Region:          "us-east-1",
-			Endpoint:        "http://127.0.0.1:1", // nothing listening
-			AccessKeyID:     "x",
-			SecretAccessKey: "y",
-		},
-		Migrations: []string{
-			`CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`,
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('x')`); err != nil {
-		t.Fatal(err)
-	}
-
-	start := time.Now()
-	err = db.Close()
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected Close to error on unreachable replica")
-	}
-	if elapsed > 10*time.Second {
-		t.Fatalf("Close did not honour ShutdownSyncTimeout; took %v", elapsed)
-	}
-}
-
 func TestRestoreFromEmptyReplicaSucceeds(t *testing.T) {
 	ctx := context.Background()
 	emptyDir := t.TempDir()

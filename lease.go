@@ -23,6 +23,12 @@ import (
 // production it is always newLeaser.
 var newLeaserFunc = newLeaser
 
+// errNonS3Backup reports that BackupTo is not an s3:// replica and so cannot be
+// leased (leasing needs the object store's atomic conditional write). Open treats
+// it as "no lease possible": RoleAuto degrades to the sole writer, while
+// RoleWriter/RoleFollower — which demand a lease — surface it.
+var errNonS3Backup = errors.New("s3lite: leasing requires an s3:// BackupTo")
+
 // newLeaser builds an s3.Leaser whose lock object lives at "<BackupTo path>/lock.json"
 // on the same bucket as the replica, using the same S3 settings as replication.
 func newLeaser(ctx context.Context, s3cfg S3Config, backupURL string, ttl time.Duration, owner string, logger *slog.Logger) (litestream.Leaser, error) {
@@ -31,7 +37,7 @@ func newLeaser(ctx context.Context, s3cfg S3Config, backupURL string, ttl time.D
 		return nil, fmt.Errorf("s3lite: invalid BackupTo URL: %w", err)
 	}
 	if u.Scheme != "s3" {
-		return nil, fmt.Errorf("s3lite: leasing requires an s3:// BackupTo (got %q)", backupURL)
+		return nil, fmt.Errorf("%w (got %q)", errNonS3Backup, backupURL)
 	}
 	bucket := u.Host
 	if bucket == "" {

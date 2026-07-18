@@ -56,49 +56,65 @@ type Config struct {
 	// caller-supplied context deadline.
 	ShutdownSyncTimeout time.Duration
 
-	// Role selects single-writer coordination. The default (RoleOff) preserves the
-	// original behaviour: whenever BackupTo is set the instance replicates as a
-	// writer, unconditionally. Any other role requires an s3:// BackupTo (the
-	// lease lives at "<BackupTo path>/lock.json" and needs conditional writes):
+	// Role selects how an instance coordinates single-writer access. Coordination
+	// needs the object store's atomic conditional write, so it applies only to an
+	// s3:// BackupTo — where the lease lives at "<BackupTo path>/lock.json" and is
+	// mandatory: an s3-replicated DB is always leased, never an uncoordinated
+	// writer. Without an s3:// BackupTo (empty, or a file:// replica) there is no
+	// shared WAL to coordinate on, so the instance is simply the sole writer and
+	// Role is moot.
 	//
+	//   RoleAuto     — try to acquire; become writer on success, follower on
+	//                  contention. The default, and the mode a serverless consumer
+	//                  wants. With no s3:// BackupTo it degrades to the sole writer.
 	//   RoleWriter   — acquire the lease or fail Open with *litestream.LeaseExistsError.
 	//   RoleFollower — never replicate; open read-only and serve the restored
 	//                  snapshot; promote to writer if the lease becomes free.
-	//   RoleAuto     — try to acquire; become writer on success, follower on
-	//                  contention. The mode a serverless consumer wants.
 	//
-	// litestream requires exactly one writer per replica; the lease enforces that
-	// by protocol so N instances run safely as one writer + many followers.
+	// RoleWriter and RoleFollower demand a lease, so Open fails if BackupTo is not
+	// s3://. litestream requires exactly one writer per replica; the lease enforces
+	// that by protocol so N instances run safely as one writer + many followers.
 	Role Role
 
-	// LeaseTTL is the lease duration for leased roles. The holder renews at TTL/3;
-	// a holder that cannot renew stops replicating before the TTL lets anyone else
-	// acquire, so two writers never overlap. When zero, DefaultLeaseTTL (30s) is
-	// used. Ignored when Role is RoleOff.
+	// LeaseTTL is the lease duration for leased instances. The holder renews at
+	// TTL/3; a holder that cannot renew stops replicating before the TTL lets anyone
+	// else acquire, so two writers never overlap. When zero, DefaultLeaseTTL (30s)
+	// is used. Ignored without an s3:// BackupTo.
 	LeaseTTL time.Duration
 
 	// Owner is the lease owner id recorded in the lock file for diagnostics. When
-	// empty, litestream generates one (hostname:pid). Ignored when Role is RoleOff.
+	// empty, litestream generates one (hostname:pid). Ignored without an s3:// BackupTo.
 	Owner string
 }
 
-// Role selects how an instance coordinates single-writer access to a replica.
+// Role selects how an instance coordinates single-writer access to an s3://
+// replica. It has no effect without one — an unreplicated or file:// DB is always
+// the sole writer, since there is no shared WAL to coordinate on.
 type Role int
 
 const (
-	// RoleOff disables leasing: BackupTo means "always replicate as writer".
-	// This is the default and matches s3lite's original behaviour.
-	RoleOff Role = iota
+	// RoleAuto acquires the lease if free (writer) or falls back to follower. The
+	// default; with no s3:// BackupTo it is simply the sole writer.
+	RoleAuto Role = iota
 	// RoleWriter requires acquiring the lease; Open fails if it is already held.
 	RoleWriter
 	// RoleFollower never replicates; it serves the restored snapshot read-only and
 	// promotes itself to writer if the lease becomes available.
 	RoleFollower
-	// RoleAuto acquires the lease if free (writer) or falls back to follower.
-	RoleAuto
 )
 
-func (r Role) leased() bool { return r != RoleOff }
+func (r Role) String() string {
+	switch r {
+	case RoleAuto:
+		return "RoleAuto"
+	case RoleWriter:
+		return "RoleWriter"
+	case RoleFollower:
+		return "RoleFollower"
+	default:
+		return fmt.Sprintf("Role(%d)", int(r))
+	}
+}
 
 // DefaultShutdownSyncTimeout is the flush deadline Close uses when
 // Config.ShutdownSyncTimeout is zero.
@@ -120,7 +136,7 @@ type S3Config struct {
 // DB wraps *sql.DB with optional litestream replication.
 // All *sql.DB methods are available directly via embedding.
 //
-// Concurrency note for leased roles (Role != RoleOff): the embedded *sql.DB is
+// Concurrency note for leased instances (s3:// BackupTo): the embedded *sql.DB is
 // stable for the whole lifetime of a writer, but a follower replaces it when it
 // promotes (it must reopen after restoring the latest state). Consumers running
 // RoleFollower/RoleAuto should therefore gate database access on IsLeader (or an
@@ -132,7 +148,7 @@ type DB struct {
 	store               *litestream.Store
 	shutdownSyncTimeout time.Duration
 
-	// Fields below support leased roles and are unused when Role is RoleOff.
+	// Fields below support leased instances and are unused without an s3:// BackupTo.
 	cfg      Config
 	logger   *slog.Logger
 	role     Role
@@ -152,17 +168,16 @@ type DB struct {
 
 // Open opens or creates a SQLite database at cfg.LocalPath.
 //
-// Lifecycle (RoleOff, the default):
+// Without an s3:// BackupTo the instance is the sole writer:
 //  1. If RestoreFrom is set and LocalPath does not exist, restore from replica.
-//  2. Start litestream replication if BackupTo is set.
+//  2. Start litestream replication if BackupTo is set (a file:// replica).
 //  3. Open the SQLite connection and apply WAL pragmas.
 //  4. Run Migrations in order.
 //
-// For leased roles (Role != RoleOff) the instance first coordinates via the
-// lease (see Config.Role): a writer replicates and runs Migrations as above; a
-// follower opens read-only, skips replication and Migrations, and serves the
-// restored snapshot. Open returns *litestream.LeaseExistsError for RoleWriter
-// when the lease is already held.
+// With an s3:// BackupTo the instance first coordinates via the lease (see
+// Config.Role): a writer replicates and runs Migrations as above; a follower opens
+// read-only, skips replication and Migrations, and serves the restored snapshot.
+// Open returns *litestream.LeaseExistsError for RoleWriter when the lease is held.
 //
 // Call Close when done to flush replication, release the lease, and free
 // resources.
@@ -195,18 +210,29 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		shutdownSyncTimeout: shutdownSyncTimeout,
 	}
 
-	if db.role.leased() {
+	// Coordination (the lease) needs the object store's atomic conditional write,
+	// which only an s3:// BackupTo provides. Build the leaser when a replica is
+	// configured; the leaser builder rejects a non-s3 replica, in which case
+	// RoleAuto falls back to the sole writer while RoleWriter/RoleFollower — which
+	// demand a lease — surface the error. An s3:// replica therefore always leases:
+	// there is no uncoordinated-writer-to-a-shared-WAL mode.
+	if cfg.BackupTo != "" {
 		leaser, err := newLeaserFunc(ctx, cfg.S3, cfg.BackupTo, leaseTTL, cfg.Owner, logger)
-		if err != nil {
+		switch {
+		case err == nil:
+			db.leaser = leaser
+		case errors.Is(err, errNonS3Backup) && db.role == RoleAuto:
+			// A non-s3 replica cannot be leased; RoleAuto is simply its sole writer.
+		default:
 			return nil, err
 		}
-		db.leaser = leaser
 	}
+	leased := db.leaser != nil
 
 	// Leased instances restore from the shared replica (BackupTo) when no explicit
 	// RestoreFrom is given — that replica is the source of truth for the group.
 	restoreFrom := cfg.RestoreFrom
-	if db.role.leased() && restoreFrom == "" {
+	if leased && restoreFrom == "" {
 		restoreFrom = cfg.BackupTo
 	}
 	if restoreFrom != "" {
@@ -221,9 +247,8 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 
-	// Decide the initial role and wire up replication / read-only accordingly.
-	switch db.role {
-	case RoleOff:
+	// No lease to coordinate on: sole writer, replicating to a file:// BackupTo if set.
+	if !leased {
 		if cfg.BackupTo != "" {
 			if err := db.startReplicationLocked(ctx); err != nil {
 				return nil, err
@@ -235,7 +260,10 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		}
 		db.isLeader = true
 		return db, nil
+	}
 
+	// s3:// BackupTo: coordinate single-writer access via the lease.
+	switch db.role {
 	case RoleWriter, RoleAuto:
 		lease, err := db.leaser.AcquireLease(ctx)
 		if err != nil {
@@ -264,7 +292,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return db, nil
 
 	default:
-		return nil, fmt.Errorf("s3lite: unknown Role %d", int(db.role))
+		return nil, fmt.Errorf("s3lite: unknown %s", db.role)
 	}
 }
 
@@ -439,9 +467,9 @@ func (db *DB) CloseContext(ctx context.Context) error {
 }
 
 // IsLeader reports whether this instance currently holds write access: it is the
-// lease holder (leased roles) or the sole writer (RoleOff). Followers return
-// false until they promote. Use it to gate whether the process should accept
-// writes.
+// lease holder, or the sole writer when unleased (no s3:// BackupTo). Followers
+// return false until they promote. Use it to gate whether the process should
+// accept writes.
 func (db *DB) IsLeader() bool {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -449,8 +477,8 @@ func (db *DB) IsLeader() bool {
 }
 
 // Generation returns the lease generation — a monotonic fencing token bumped on
-// each takeover — or 0 when not holding a lease (or RoleOff). A consumer can use
-// it to fence external side effects against a stale writer.
+// each takeover — or 0 when not holding a lease (including an unleased sole
+// writer). A consumer can use it to fence external side effects against a stale writer.
 func (db *DB) Generation() int64 {
 	db.mu.Lock()
 	defer db.mu.Unlock()
