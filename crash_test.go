@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,6 +154,14 @@ func TestHardKillRestoresConsistentPrefix(t *testing.T) {
 		_ = cmd.Wait()
 		t.Fatalf("crash child exited before the row target (lastAcked=%d); see stderr above", lastAcked)
 	}
+
+	// Randomize when the kill lands relative to the child's insert/checkpoint/sync
+	// cycle: the scanner loop above always breaks just after an ack, so without this
+	// jitter the SIGKILL would sample only inter-insert gaps and never, say, a WAL
+	// checkpoint or a mid-sync moment. The delay is logged so a failure reproduces.
+	killDelay := time.Duration(rand.Intn(300)) * time.Millisecond
+	t.Logf("hard kill: delaying SIGKILL by %v to vary where it lands", killDelay)
+	time.Sleep(killDelay)
 
 	// Hard kill: SIGKILL runs no cleanup — no Close, no final sync.
 	if err := cmd.Process.Kill(); err != nil {

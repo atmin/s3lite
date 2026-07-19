@@ -1,11 +1,14 @@
 package s3lite
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -89,12 +92,13 @@ func cloneLease(l *litestream.Lease) *litestream.Lease {
 }
 
 type fakeLeaser struct {
-	lock        *fakeLock
-	owner       string
-	ttl         time.Duration
-	acquireN    atomic.Int64 // number of AcquireLease attempts that reached the lock
-	renewN      atomic.Int64 // number of RenewLease attempts that reached the leaser
-	renewBlocks atomic.Bool  // model a renew into a network black hole (see RenewLease)
+	lock         *fakeLock
+	owner        string
+	ttl          time.Duration
+	acquireN     atomic.Int64 // number of AcquireLease attempts that reached the lock
+	renewN       atomic.Int64 // number of RenewLease attempts that reached the leaser
+	renewBlocks  atomic.Bool  // model a renew into a network black hole (see RenewLease)
+	releaseFails atomic.Bool  // model a release lost to the network (see ReleaseLease)
 }
 
 func (f *fakeLeaser) Type() string { return "fake" }
@@ -120,6 +124,9 @@ func (f *fakeLeaser) RenewLease(ctx context.Context, l *litestream.Lease) (*lite
 	return f.lock.renew(l, f.owner, f.ttl)
 }
 func (f *fakeLeaser) ReleaseLease(ctx context.Context, l *litestream.Lease) error {
+	if f.releaseFails.Load() {
+		return errors.New("release boom")
+	}
 	return f.lock.release(l)
 }
 
@@ -2251,4 +2258,214 @@ func TestOpenFailureReleasesLease(t *testing.T) {
 	if held != nil {
 		t.Fatalf("Open failure must release the acquired lease, still held by %s", held.Owner)
 	}
+}
+
+// syncBuffer is a mutex-guarded bytes.Buffer for capturing log output written from
+// background goroutines (the lease loop) while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestFailedReleaseAfterFailedPromoteIsLoggedAndSwallowed(t *testing.T) {
+	// The worst promotion outcome: acquire succeeds, the restore fails, AND the
+	// compensating release is lost to the network. releaseQuietly must log the
+	// failed release and swallow it — the instance stays a serving follower, and the
+	// stuck lease simply times out on the store (nothing here can force-release it).
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	failRestore := installRestoreFailSwitch(t)
+	ctx := context.Background()
+
+	logBuf := &syncBuffer{}
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute, // long: promotion happens only via TryPromote below
+		Logger:    slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	failRestore.Store(true)
+	db.leaser.(*fakeLeaser).releaseFails.Store(true)
+
+	ok, err := db.TryPromote(ctx)
+	if ok || err == nil {
+		t.Fatalf("promote should fail on the restore: ok=%v err=%v", ok, err)
+	}
+	if db.IsLeader() {
+		t.Fatal("instance must remain a follower")
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("follower must keep serving after the failed promote+release: %v", err)
+	}
+	if out := logBuf.String(); !strings.Contains(out, "release lease failed") {
+		t.Fatalf("the failed release must be logged, got:\n%s", out)
+	}
+	// The lease stays held (the release was lost) until its TTL expires — that is
+	// the documented cost, not a hang or a panic.
+	lock.mu.Lock()
+	held := lock.lease
+	lock.mu.Unlock()
+	if held == nil {
+		t.Fatal("a lost release cannot have freed the lease")
+	}
+}
+
+func TestDemoteOnNonLeaderIsNoOp(t *testing.T) {
+	// demote's guard: a demotion request on an instance that is not (or no longer)
+	// the leader must do nothing — no OnDemote, no mode change, no panic. The loop
+	// can only race one demotion per renew failure, but the guard is what makes a
+	// double demote harmless, so pin it directly.
+	lock := &fakeLock{}
+	lock.steal("other-instance", time.Minute) // held elsewhere: opens as a follower
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	fired := false
+	db.OnDemote(func(error) { fired = true })
+
+	db.demote(errors.New("spurious")) // synchronous: returns via the guard
+
+	if fired {
+		t.Fatal("demote on a non-leader must not fire OnDemote")
+	}
+	if db.IsLeader() {
+		t.Fatal("still a follower")
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("follower must keep serving after a spurious demote: %v", err)
+	}
+}
+
+func TestOpenUnknownRoleErrors(t *testing.T) {
+	// A leased Open with a Role outside the defined set must fail loudly, naming the
+	// value — not silently pick a behaviour.
+	installFakeLeaser(t, &fakeLock{})
+
+	_, err := Open(context.Background(), Config{
+		LocalPath: filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      Role(99),
+	})
+	if err == nil {
+		t.Fatal("Open with an unknown Role must fail")
+	}
+	if !strings.Contains(err.Error(), "Role(99)") {
+		t.Fatalf("error should name the unknown role, got: %v", err)
+	}
+}
+
+func TestFollowerRefreshStaleTempFailureKeepsServing(t *testing.T) {
+	// The rebuild's first step clears a stale temp from a crashed prior rebuild. If
+	// even that fails (here: the temp path is occupied by a non-empty directory, so
+	// os.Remove fails), the refresh must fail cleanly BEFORE touching the live files
+	// — the follower keeps serving — and must recover once the obstruction is gone.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := t.TempDir()
+
+	// The leader holds the lease for the whole test (long TTL), so the follower
+	// below never promotes — only refresh ticks drive its rebuilds.
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   "file://" + replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	localPath := filepath.Join(t.TempDir(), "follower.sqlite3")
+	// Occupy the temp path with a non-empty directory before the follower opens.
+	tmp := localPath + ".restoring"
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "obstruction"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               localPath,
+		BackupTo:                "file://" + replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	// Advance the replica so every tick attempts (and fails) a rebuild.
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v2')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+			t.Fatalf("follower stopped serving while the stale-temp clear failed: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("follower must keep its Open snapshot (1 row) while rebuilds fail, got %d", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Remove the obstruction; the next tick rebuilds and converges.
+	if err := os.RemoveAll(tmp); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
+	}, "follower to converge once the stale temp is clearable")
 }

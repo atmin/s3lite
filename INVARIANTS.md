@@ -30,8 +30,16 @@ bounded by a deadline derived from the held lease (`ExpiresAt - LeaseTTL/6`); a 
 that hangs (an S3 black hole) forces a demotion rather than stalling past expiry. A
 renew interrupted by `Close` is a shutdown, not a lost lease, and does not demote.
 
+One inherent limit: expiry judgments compare `ExpiresAt` (stamped from the holder's
+clock at acquire/renew time) against each instance's local clock, so severe clock
+skew between instances erodes the fencing margin. The `LeaseTTL/6` deadline margin
+absorbs modest skew; keep instance clocks NTP-disciplined and do not run TTLs short
+enough that expected skew is a meaningful fraction of them.
+
 *Enforced by:* `TestBlockingRenewDemotesBeforeExpiry`,
-`TestShutdownDuringRenewDoesNotDemote`, `TestLeaseLossDemotesWriter`.
+`TestShutdownDuringRenewDoesNotDemote`, `TestLeaseLossDemotesWriter`. Over real S3:
+`TestLeaseStealFencesWriterS3` (a foreign lock replacement fails the holder's next
+renew, which demotes and fences, and the successor continues the generation sequence).
 
 ## 3. Demotion fences the cached handle, including in-flight transactions
 
@@ -55,7 +63,11 @@ error rather than hang. `Close` is idempotent across sequential calls.
 
 *Enforced by:* `TestCloseIsDurableWithoutExplicitSync`,
 `TestCleanCloseAcrossProcessBoundary` (across a real process boundary),
-`TestCloseBoundedOnUnreachableReplica`, `TestDoubleCloseIsIdempotent`.
+`TestCloseBoundedOnUnreachableReplica`, `TestDoubleCloseIsIdempotent`. Over real S3:
+`TestWriterSurvivesReplicaOutageS3` (writes keep succeeding locally through an S3
+outage, `Sync` fails bounded instead of hanging, replication recovers when S3
+returns, and the eventual `Close` loses nothing — including rows written while S3
+was down).
 
 ## 5. A hard kill loses at most the unsynced tail; the restore is a consistent prefix
 
@@ -79,6 +91,7 @@ live database.
 
 *Enforced by:* `TestFollowerRefreshSeesNewWrites`,
 `TestFollowerRefreshRestoreFailureKeepsState`, `TestFollowerRefreshNoOpWhenUnchanged`,
+`TestFollowerRefreshStaleTempFailureKeepsServing`,
 `TestPromoteRestoreFailureLeavesServingFollower`.
 
 ## 7. The stable `*sql.DB` is never reassigned
@@ -88,9 +101,15 @@ promote/demote/refresh. Take it once (`database := db.DB`), hand it to repositor
 and keep using it: connections are transparently re-dialed against the current local
 file in the current mode. Callers never need to re-fetch the handle.
 
+A corollary: a rebuild (promote/refresh) can hold the connection gate for as long as
+a full restore takes, but a query carrying its own deadline is never stuck behind it —
+it fails at its deadline and the handle recovers once the swap releases.
+
 *Enforced by:* `TestCachedHandleSurvivesPromotion`,
 `TestCachedHandleConcurrentReadsAcrossPromotion`,
-`TestFollowerRefreshConcurrentReadsSurviveSwap`, and the chaos soak's per-slot readers.
+`TestFollowerRefreshConcurrentReadsSurviveSwap`, the chaos soak's per-slot readers,
+and — for the deadline corollary — `TestConnectHonoursContextDuringSwap` and
+`TestQueryDeadlineNotStuckBehindSwap`.
 
 ## 8. `Generation` semantics — no more than documented
 

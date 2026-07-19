@@ -442,3 +442,21 @@ func TestRestoreSkippedWhenLocalExists(t *testing.T) {
 		t.Fatal("restore clobbered existing local file")
 	}
 }
+
+func TestRoleString(t *testing.T) {
+	// Role values render by name in logs and errors; an unknown value must still
+	// print something identifying rather than a bare integer.
+	for _, tc := range []struct {
+		role s3lite.Role
+		want string
+	}{
+		{s3lite.RoleAuto, "RoleAuto"},
+		{s3lite.RoleWriter, "RoleWriter"},
+		{s3lite.RoleFollower, "RoleFollower"},
+		{s3lite.Role(99), "Role(99)"},
+	} {
+		if got := tc.role.String(); got != tc.want {
+			t.Errorf("Role(%d).String() = %q, want %q", int(tc.role), got, tc.want)
+		}
+	}
+}

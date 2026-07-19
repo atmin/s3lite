@@ -29,6 +29,16 @@ TESTCONTAINERS_RYUK_DISABLED=true go test -tags=integration ./...
 
 Containers are still terminated via `t.Cleanup`, so there's no leak.
 
+### Colima users
+
+Testcontainers looks for the Docker socket at `/var/run/docker.sock` and does not
+read the Docker CLI's context, so point it at Colima's socket explicitly:
+
+```bash
+DOCKER_HOST=unix://$HOME/.colima/default/docker.sock \
+TESTCONTAINERS_RYUK_DISABLED=true go test -tags=integration ./...
+```
+
 ## Manual smoke test against an existing S3
 
 If you want to validate against a real bucket (AWS, Scaleway, R2, etc.),
