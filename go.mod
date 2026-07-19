@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.6
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.95.0
-	github.com/benbjohnson/litestream v0.5.13
+	github.com/benbjohnson/litestream v0.5.14
 	github.com/moby/moby/client v0.4.0
 	github.com/superfly/ltx v0.5.1
 	github.com/testcontainers/testcontainers-go v0.42.0

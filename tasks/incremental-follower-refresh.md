@@ -45,7 +45,8 @@ full-restore for now and note incremental promote as a follow-up.
 
 ## The catch (why this is design-first, not mechanical)
 
-litestream v0.5.13's **only** incremental mechanism is `RestoreOptions.Follow`:
+litestream (through v0.5.14, the current release) has **only** one incremental
+mechanism, `RestoreOptions.Follow`:
 
 - With `Follow: true` on a fresh path it does the initial full restore, writes a
   `<path>-txid` sidecar (`WriteTXIDFile`), then enters `Replica.follow` — an
