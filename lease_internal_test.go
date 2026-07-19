@@ -1803,3 +1803,258 @@ func TestGenerationResetsOnCleanHandoff(t *testing.T) {
 		t.Fatalf("after a clean handoff the fresh writer resets to generation 1, got %d", got)
 	}
 }
+
+func TestInFlightTxCannotCommitAfterDemote(t *testing.T) {
+	// A transaction begun while leader and still open at demotion must not commit:
+	// the demoted writer no longer holds the lease, so a local commit would never
+	// replicate and would vanish at the next promote-restore while a follower serves
+	// phantom rows. The driver-level fence rolls the tx back and fails Commit.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 300 * time.Millisecond
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if err := db1.Sync(ctx); err != nil { // publish the schema so a successor can restore it
+		t.Fatal(err)
+	}
+
+	demoted := make(chan error, 1)
+	db1.OnDemote(func(err error) { demoted <- err })
+
+	// Begin a tx and insert while still the leader (connection dialed read-write).
+	tx, err := db1.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO items (name) VALUES ('phantom')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Lose the lease; wait for the demote fence to fire.
+	lock.steal("thief", time.Minute)
+	select {
+	case <-demoted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("writer did not demote after losing the lease")
+	}
+
+	// The commit must fail — the fence.
+	if err := tx.Commit(); err == nil {
+		t.Fatal("committing a tx after demote must fail (fencing)")
+	}
+
+	// The row must be absent locally: the fenced commit rolled it back.
+	var n int
+	if err := db1.QueryRowContext(ctx, `SELECT count(*) FROM items WHERE name='phantom'`).Scan(&n); err != nil {
+		t.Fatalf("read after fenced commit: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("phantom row must not persist locally after a fenced commit, got %d", n)
+	}
+
+	// And absent from the replica's restored state — it never replicated.
+	db2, err := Open(ctx, Config{
+		LocalPath:   filepath.Join(t.TempDir(), "successor.sqlite3"),
+		RestoreFrom: replicaDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM items WHERE name='phantom'`).Scan(&n); err != nil {
+		t.Fatalf("read restored successor: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("phantom row must not appear in the replica, got %d", n)
+	}
+}
+
+func TestCheckedOutConnWriteFencedOnDemote(t *testing.T) {
+	// A *sql.Conn checked out before demotion is pinned to its read-write connection
+	// (no pool re-dial). The driver-level fence must reject writes on it after demote,
+	// or the demoted writer would persist locally on a lease it no longer holds.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	ttl := 300 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "writer",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `INSERT INTO items (name) VALUES ('ok')`); err != nil {
+		t.Fatalf("checked-out conn should write while leader: %v", err)
+	}
+
+	demoted := make(chan error, 1)
+	db.OnDemote(func(err error) { demoted <- err })
+	lock.steal("thief", time.Minute)
+	select {
+	case <-demoted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("writer did not demote")
+	}
+
+	// The same pinned connection must now reject writes.
+	if _, err := conn.ExecContext(ctx, `INSERT INTO items (name) VALUES ('fenced')`); err == nil {
+		t.Fatal("checked-out conn must reject writes after demote")
+	}
+}
+
+func TestReaderTxAcrossRefreshSwapStillReads(t *testing.T) {
+	// Reads are deliberately not fenced: a read transaction held across a follower
+	// refresh swap keeps serving its consistent (old) snapshot rather than erroring.
+	// This pins the design choice that refresh does not kill in-flight readers.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('a')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+	waitFor(t, 3*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 1
+	}, "follower to serve its Open snapshot")
+
+	// Open a read tx and pin its snapshot with a first read (1 row).
+	tx, err := cached.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback() // Rollback always succeeds; a Commit here may fail (stale) — the documented cost
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("initial read in tx: n=%d err=%v, want 1", n, err)
+	}
+
+	// Advance the replica so the follower performs a refresh swap under the open tx.
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('b')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		var m int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&m) == nil && m == 2
+	}, "a fresh read to observe the swapped-in 2 rows")
+
+	// The open tx must still read its consistent snapshot — 1 row, no error, no tear.
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+		t.Fatalf("read tx across the swap must keep serving: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("read tx must see its pinned snapshot (1 row), got %d", n)
+	}
+}
+
+func TestDoubleCloseIsIdempotent(t *testing.T) {
+	// Close must be safe to call more than once sequentially: the second call is a
+	// nil no-op, not a SyncAndWait on an already-closed litestream DB.
+	t.Run("leader", func(t *testing.T) {
+		lock := &fakeLock{}
+		installFakeLeaser(t, lock)
+		ctx := context.Background()
+		db, err := Open(ctx, Config{
+			LocalPath:  filepath.Join(t.TempDir(), "w.sqlite3"),
+			BackupTo:   "file://" + t.TempDir(),
+			Role:       RoleWriter,
+			Owner:      "w",
+			LeaseTTL:   time.Minute,
+			Migrations: []string{itemsSchema},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("first close: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("second close must be a nil no-op, got %v", err)
+		}
+	})
+
+	t.Run("follower", func(t *testing.T) {
+		lock := &fakeLock{}
+		lock.steal("other-instance", time.Minute) // held elsewhere: stays a follower
+		installFakeLeaser(t, lock)
+		ctx := context.Background()
+		db, err := Open(ctx, Config{
+			LocalPath: filepath.Join(t.TempDir(), "f.sqlite3"),
+			BackupTo:  "file://" + t.TempDir(),
+			Role:      RoleFollower,
+			Owner:     "f",
+			LeaseTTL:  time.Minute,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if db.IsLeader() {
+			t.Fatal("should be a follower")
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("first close: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("second close must be a nil no-op, got %v", err)
+		}
+	})
+}

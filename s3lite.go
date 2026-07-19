@@ -161,6 +161,16 @@ type S3Config struct {
 // OnPromote/OnDemote only to make decisions about role; you never need them to
 // keep a handle valid. A follower's handle rejects writes (query_only), so gate
 // write paths on IsLeader if you serve traffic before promotion.
+//
+// Fencing caveats for a misbehaving consumer:
+//   - A follower can escape read-only mode with PRAGMA query_only=0 and write to its
+//     local file. Such writes never replicate and are destroyed by the next
+//     restore/refresh — do not do this.
+//   - Demote fences the cached handle, including in-flight transactions and writes on
+//     a checked-out *sql.Conn. One residual hole is not closed: a *sql.Stmt prepared
+//     and then executed on a connection that was already checked out before the demote
+//     bypasses the driver-level write fence. Prepared-statement writes should still be
+//     gated on IsLeader.
 type DB struct {
 	*sql.DB
 	connector           *stableConnector
@@ -452,6 +462,10 @@ func (db *DB) Close() error {
 // graceful-shutdown deadline. The database handle is always closed even if the
 // flush errors or ctx expires. For a leader it also releases the lease so a
 // successor can take over immediately rather than waiting out the TTL.
+//
+// It is safe to call Close/CloseContext more than once sequentially: after the
+// first call every later call is a nil no-op. (Concurrent calls from multiple
+// goroutines are not made safe — serialise your shutdown.)
 func (db *DB) CloseContext(ctx context.Context) error {
 	// Stop the renew/promotion loop first and wait for it to exit, so it cannot
 	// race the teardown below (e.g. renew a lease we are about to release, or
@@ -464,6 +478,11 @@ func (db *DB) CloseContext(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Idempotent: a second (sequential) Close must not run SyncAndWait on an
+	// already-closed litestream DB. The first call closed everything below.
+	if db.closed {
+		return nil
+	}
 	// Mark closed under mu before teardown: a TryPromote that is mid-restore will
 	// see this when it reaches its own mu section (promote) and abort rather than
 	// bring replication back up on a torn-down instance.
@@ -548,9 +567,11 @@ func (db *DB) Generation() int64 {
 }
 
 // OnPromote registers a callback fired after this instance becomes the writer
-// (lease acquired and replication started). It must not call Close and should
-// return quickly. Set it before Open returns control to other goroutines; it is
-// not safe to change concurrently with a role transition.
+// (lease acquired and replication started). It must not call Close — the callback
+// runs on the lease-loop goroutine and Close blocks waiting for that goroutine to
+// exit, so calling Close from here deadlocks — and it should return quickly. Set it
+// before Open returns control to other goroutines; it is not safe to change
+// concurrently with a role transition.
 func (db *DB) OnPromote(fn func()) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -559,7 +580,9 @@ func (db *DB) OnPromote(fn func()) {
 
 // OnDemote registers a callback fired after this instance loses the lease and
 // stops replicating (the err explains why). The consumer must stop accepting
-// writes on demotion. It must not call Close and should return quickly.
+// writes on demotion. It must not call Close — the callback runs on the lease-loop
+// goroutine and Close blocks waiting for that goroutine to exit, so calling Close
+// from here deadlocks — and it should return quickly.
 func (db *DB) OnDemote(fn func(error)) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -569,8 +592,10 @@ func (db *DB) OnDemote(fn func(error)) {
 // OnRefresh registers a callback fired after a follower refresh swaps in newer
 // state from the replica (see Config.FollowerRefreshInterval), e.g. to bust caches
 // built on the previous snapshot. It never fires for a writer or when a tick finds
-// nothing new. It must not call Close and should return quickly. Set it before
-// Open returns control to other goroutines.
+// nothing new. It must not call Close — the callback runs on the lease-loop
+// goroutine and Close blocks waiting for that goroutine to exit, so calling Close
+// from here deadlocks — and it should return quickly. Set it before Open returns
+// control to other goroutines.
 func (db *DB) OnRefresh(fn func()) {
 	db.mu.Lock()
 	defer db.mu.Unlock()

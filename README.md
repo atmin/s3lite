@@ -185,6 +185,18 @@ mode. A follower's handle is read-only (`query_only`), so if you serve traffic
 before promotion, gate *write* paths on `IsLeader`; you never need `IsLeader` or
 `OnPromote` merely to keep a handle valid.
 
+On demotion the handle is fenced: new writes, writes on a checked-out `*sql.Conn`,
+and the `Commit` of a transaction begun while leader are all rejected, so a demoted
+writer cannot persist locally on a lease it no longer holds. Two foot-guns are on
+you, not the library:
+
+- **Do not call `Close` from an `OnPromote`/`OnDemote`/`OnRefresh` callback.** Those
+  callbacks run on the internal lease-loop goroutine, and `Close` blocks waiting for
+  that goroutine to exit — calling it from inside a callback deadlocks.
+- **Do not defeat `query_only` on a follower** (e.g. `PRAGMA query_only=0`). A
+  follower's local writes never replicate and are silently destroyed by the next
+  restore or refresh.
+
 ## Configuration
 
 s3lite itself reads no environment variables. Pass S3 settings via `S3Config`.

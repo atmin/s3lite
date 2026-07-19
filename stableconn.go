@@ -185,12 +185,28 @@ func (g *genConn) PrepareContext(ctx context.Context, query string) (driver.Stmt
 }
 
 func (g *genConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	var (
+		tx  driver.Tx
+		err error
+	)
 	if b, ok := g.Conn.(driver.ConnBeginTx); ok {
-		return b.BeginTx(ctx, opts)
+		tx, err = b.BeginTx(ctx, opts)
+	} else {
+		tx, err = g.Conn.Begin() //nolint:staticcheck // fallback for drivers without ConnBeginTx
 	}
-	return g.Conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	// Wrap so a Commit after the connection went stale is refused (see genTx): a tx
+	// begun on the leader must not commit locally once we have been demoted.
+	return &genTx{Tx: tx, conn: g}, nil
 }
 
+// QueryContext is deliberately NOT fenced on staleness. A reader on a connection
+// dialed before a swap still holds the old inode and sees a consistent (if stale)
+// snapshot; failing such reads would only churn follower refresh with no correctness
+// gain, since a stale read can never corrupt the replica. Writes are a different
+// matter and are fenced in ExecContext.
 func (g *genConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if q, ok := g.Conn.(driver.QueryerContext); ok {
 		return q.QueryContext(ctx, query, args)
@@ -199,6 +215,16 @@ func (g *genConn) QueryContext(ctx context.Context, query string, args []driver.
 }
 
 func (g *genConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	// Fence autocommit writes on a stale connection. Demote bumps the generation to
+	// flip the handle read-only, but a connection checked out before the demote (an
+	// autocommit Exec on a *sql.Conn, or a stale pooled conn) is still a read-write
+	// handle to the local file. Without this check it would commit locally on a lease
+	// we no longer hold; that write never replicates and vanishes at the next restore
+	// while a follower serves phantom rows. Returning ErrBadConn discards the conn —
+	// a pooled caller re-dials read-only, a pinned *sql.Conn caller gets the error.
+	if g.stale() {
+		return nil, driver.ErrBadConn
+	}
 	if e, ok := g.Conn.(driver.ExecerContext); ok {
 		return e.ExecContext(ctx, query, args)
 	}
@@ -217,4 +243,25 @@ func (g *genConn) Ping(ctx context.Context) error {
 		return p.Ping(ctx)
 	}
 	return nil
+}
+
+// genTx wraps a driver transaction so a Commit after the connection's generation
+// moved on (a demote fenced the handle) is refused: the tx is rolled back and the
+// caller gets driver.ErrBadConn. This closes the hole where a transaction begun on
+// the leader and still open at demotion would commit locally on a lease we no longer
+// hold — persisting a write that never replicates and is destroyed by the next
+// restore. Rollback is left to the embedded Tx (discarding is always safe); a read
+// tx whose Commit fails across a refresh swap is a rare, retryable error, which is
+// the documented cost of not fencing reads.
+type genTx struct {
+	driver.Tx
+	conn *genConn
+}
+
+func (t *genTx) Commit() error {
+	if t.conn.stale() {
+		_ = t.Tx.Rollback()
+		return driver.ErrBadConn
+	}
+	return t.Tx.Commit()
 }

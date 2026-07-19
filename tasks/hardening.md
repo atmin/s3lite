@@ -274,7 +274,7 @@ process boundary, which is the point.
 
 ---
 
-## Item 6 — [ ] Buggy-consumer fencing: in-flight transactions survive demote; double Close
+## Item 6 — [x] Buggy-consumer fencing: in-flight transactions survive demote; double Close
 
 **Claim (a).** The demote fence (`connector.setMode(true)`) only invalidates
 connections at **pool reuse** (`ResetSession`/`IsValid`). A transaction begun
