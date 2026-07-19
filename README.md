@@ -215,3 +215,10 @@ blank and rely on the instance role.
 - A clean `Close` is durable: it flushes all committed writes to the replica
   before returning (bounded by `Config.ShutdownSyncTimeout`, default 30s). Only a
   *hard* crash/kill can lose the sub-second window since litestream's last sync.
+
+## Guarantees
+
+The correctness guarantees — single writer per replica, fencing on demotion,
+durability, follower staleness bounds, handle stability — are written up in
+[INVARIANTS.md](INVARIANTS.md), each naming the test that fails if it breaks.
+Read it if you are deciding whether to trust s3lite with your data.
