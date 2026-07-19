@@ -143,7 +143,7 @@ Re-verify rather than trusting this.)
 
 ---
 
-## Item 3 — [ ] A failed refresh/promote restore destroys the follower's local state
+## Item 3 — [x] A failed refresh/promote restore destroys the follower's local state
 
 **Claim.** `Config.FollowerRefreshInterval` docs promise a failed refresh leaves
 the follower "serving its current state". But the swap callbacks in

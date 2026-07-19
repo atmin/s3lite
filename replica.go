@@ -91,6 +91,13 @@ func replicaLatestTXID(ctx context.Context, s3Cfg S3Config, rawURL string) (ltx.
 	return maxTXID, nil
 }
 
+// restoreDBFunc is the restore entry point used by the follower rebuild path
+// (rebuildLocalFromReplica). It is a package var so tests can inject restore
+// failures without a real backend, mirroring newLeaserFunc / replicaLatestTXIDFunc;
+// in production it is always restoreDB. Open's initial restore deliberately calls
+// restoreDB directly, so injecting here isolates the refresh/promote rebuild.
+var restoreDBFunc = restoreDB
+
 func restoreDB(ctx context.Context, s3Cfg S3Config, rawURL, destPath string) error {
 	client, err := newReplicaClient(s3Cfg, rawURL)
 	if err != nil {

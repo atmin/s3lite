@@ -352,15 +352,12 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 	}
 
 	swapErr := db.connector.swapFiles(true, func() error { // stays read-only
-		if err := removeLocalDBFiles(db.cfg.LocalPath); err != nil {
-			return fmt.Errorf("s3lite: refresh: clear local files: %w", err)
-		}
-		if err := restoreDB(ctx, db.cfg.S3, db.cfg.BackupTo, db.cfg.LocalPath); err != nil {
-			return fmt.Errorf("s3lite: refresh: restore: %w", err)
-		}
-		return precreateWAL(ctx, db.cfg.LocalPath)
+		return db.rebuildLocalFromReplica(ctx)
 	})
 	if swapErr != nil {
+		// The rebuild is atomic: on failure the live files are untouched, so the
+		// follower keeps serving its current state — the swap only bumped the
+		// generation, so in-flight connections re-dial against that same state.
 		return swapErr
 	}
 	db.lastRefreshPos = pos
@@ -391,19 +388,16 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 	// no query observes a half-restored database, then flip the handle writable.
 	// The stable *sql.DB is never replaced: superseded follower connections are
 	// dropped from the pool automatically once the generation advances, and any
-	// handle a caller cached stays valid. Restore refuses to overwrite an existing
-	// output path, so the stale follower files are cleared first.
+	// handle a caller cached stays valid.
 	swapErr := db.connector.swapFiles(false, func() error {
-		if err := removeLocalDBFiles(db.cfg.LocalPath); err != nil {
-			return fmt.Errorf("s3lite: promote: clear local files: %w", err)
-		}
-		if err := restoreDB(ctx, db.cfg.S3, db.cfg.BackupTo, db.cfg.LocalPath); err != nil {
-			return fmt.Errorf("s3lite: promote: restore: %w", err)
-		}
-		return precreateWAL(ctx, db.cfg.LocalPath)
+		return db.rebuildLocalFromReplica(ctx)
 	})
 	if swapErr != nil {
-		db.connector.setMode(true) // remain a read-only follower
+		// The rebuild is atomic, so a failed restore left the local files intact:
+		// we genuinely remain a read-only follower still serving our current
+		// snapshot. Re-assert read-only — the swap set the mode writable in its
+		// deferred flip even though fn failed.
+		db.connector.setMode(true)
 		return swapErr
 	}
 
@@ -428,6 +422,53 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 		onPromote()
 	}
 	return nil
+}
+
+// rebuildLocalFromReplica atomically replaces the local database with the
+// replica's latest committed state. It restores into a sibling temp path and only
+// swaps that into place once the restore has fully succeeded, so a restore that
+// fails partway (a network drop, an unreachable replica) leaves the existing local
+// files untouched — the caller keeps serving its current state. Both the follower
+// refresh and promote use it, so the two paths cannot drift.
+//
+// It runs inside a connector swap (connection creation is gated), so no query ever
+// observes a half-built database.
+func (db *DB) rebuildLocalFromReplica(ctx context.Context) error {
+	path := db.cfg.LocalPath
+	tmp := path + ".restoring"
+
+	// A leftover temp from a crashed prior rebuild must not be mistaken for a fresh
+	// restore below, so clear it (and its sidecars) first.
+	if err := removeLocalDBFiles(tmp); err != nil {
+		return fmt.Errorf("s3lite: rebuild: clear stale temp: %w", err)
+	}
+	if err := restoreDBFunc(ctx, db.cfg.S3, db.cfg.BackupTo, tmp); err != nil {
+		// Restore failed without touching the live files: keep serving current state.
+		return fmt.Errorf("s3lite: rebuild: restore: %w", err)
+	}
+
+	// Empty-replica case: restoreDBFunc returns nil without creating tmp when the
+	// replica has no data yet (a fresh bucket). Fall back to a clean local reset so
+	// a first promote against an empty replica yields a writable empty DB.
+	if _, err := os.Stat(tmp); os.IsNotExist(err) {
+		if err := removeLocalDBFiles(path); err != nil {
+			return fmt.Errorf("s3lite: rebuild: clear local files: %w", err)
+		}
+		return precreateWAL(ctx, path)
+	} else if err != nil {
+		return fmt.Errorf("s3lite: rebuild: stat temp: %w", err)
+	}
+
+	// Restore populated tmp. Only now tear down the old files and rename the fresh
+	// copy into place. A crash between the remove and the rename leaves no local
+	// file, which the next Open restores from the replica — already safe.
+	if err := removeLocalDBFiles(path); err != nil {
+		return fmt.Errorf("s3lite: rebuild: clear local files: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("s3lite: rebuild: rename temp into place: %w", err)
+	}
+	return precreateWAL(ctx, path)
 }
 
 // releaseQuietly releases a lease we acquired but could not promote onto,

@@ -1502,3 +1502,228 @@ func TestSyncNoReplicaIsNoOp(t *testing.T) {
 		t.Fatalf("Sync without a replication store must be a nil no-op, got %v", err)
 	}
 }
+
+// installRestoreFailSwitch routes restoreDBFunc through a switch: while the
+// returned flag is false the real restore runs, once set it fails. Assigned once
+// before any refresh/promote goroutine could read it, so flipping the atomic flag
+// is the only concurrent mutation.
+func installRestoreFailSwitch(t *testing.T) *atomic.Bool {
+	t.Helper()
+	var fail atomic.Bool
+	prev := restoreDBFunc
+	restoreDBFunc = func(ctx context.Context, s3 S3Config, url, dest string) error {
+		if fail.Load() {
+			return errors.New("restore boom")
+		}
+		return prev(ctx, s3, url, dest)
+	}
+	t.Cleanup(func() { restoreDBFunc = prev })
+	return &fail
+}
+
+func TestFollowerRefreshRestoreFailureKeepsState(t *testing.T) {
+	// A refresh whose restore fails must leave the follower serving its current
+	// state, never an empty "no such table" database. The old rebuild deleted the
+	// local files before restoring, so a mid-restore failure destroyed the follower;
+	// the atomic rebuild leaves the live files untouched on failure. Once the failure
+	// clears, the follower converges to the new state.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	failRestore := installRestoreFailSwitch(t)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	// Leader publishes one row; it holds the lease (long TTL) so the follower never
+	// promotes and only refresh drives its restores.
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	// The follower restored v1 at Open (Open's restore does not go through the
+	// injected seam), so it serves one row now.
+	waitFor(t, 3*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 1
+	}, "follower to serve its Open snapshot")
+
+	// From here every refresh restore fails; advance the replica so the probe reports
+	// something new and the follower keeps trying (and failing) to restore it.
+	failRestore.Store(true)
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v2')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Across many failing refresh ticks the follower must keep answering with its
+	// pre-failure state — the destructive bug shows up here as an error ("no such
+	// table") or an empty result.
+	deadline := time.Now().Add(400 * time.Millisecond)
+	goodReads := 0
+	for time.Now().Before(deadline) {
+		var n int
+		if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+			t.Fatalf("follower stopped serving during a failed refresh (state destroyed): %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("follower lost its state during a failed refresh: got %d rows, want 1", n)
+		}
+		goodReads++
+		time.Sleep(10 * time.Millisecond)
+	}
+	if goodReads == 0 {
+		t.Fatal("no reads happened during the failing window")
+	}
+
+	// Clear the failure; the follower must now converge to the advanced state.
+	failRestore.Store(false)
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
+	}, "follower to converge once restore recovers")
+}
+
+func TestPromoteRestoreFailureLeavesServingFollower(t *testing.T) {
+	// A promote whose restore fails must leave a serving read-only follower (of its
+	// intact snapshot, not a deleted file) and must release the lease it acquired so
+	// another instance can take over. Exercises releaseQuietly on the failure path.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	failRestore := installRestoreFailSwitch(t)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	// A leader seeds one row, then cleanly closes so the lease is free.
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(); err != nil { // durable flush + release
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute, // long: no background promote ticks during the test
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	// The follower restored v1 at Open.
+	var n int
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("follower should serve v1 at Open: n=%d err=%v", n, err)
+	}
+
+	// Promote now fails on the restore step.
+	failRestore.Store(true)
+	ok, err := db2.TryPromote(ctx)
+	if ok || err == nil {
+		t.Fatalf("promote should fail when restore fails: ok=%v err=%v", ok, err)
+	}
+
+	// Still a follower, still serving v1 read-only.
+	if db2.IsLeader() {
+		t.Fatal("a failed promote must leave the instance a follower")
+	}
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("follower must still serve v1 after a failed promote: n=%d err=%v", n, err)
+	}
+	if _, err := db2.ExecContext(ctx, `INSERT INTO items (name) VALUES ('nope')`); err == nil {
+		t.Fatal("a failed promote must leave the handle read-only")
+	}
+	// The acquired lease was released, so a successor could take over.
+	lock.mu.Lock()
+	held := lock.lease
+	lock.mu.Unlock()
+	if held != nil {
+		t.Fatalf("failed promote must release the lease, still held by %s", held.Owner)
+	}
+}
+
+func TestPromoteFreshBucketEmptyReplica(t *testing.T) {
+	// The empty-replica fallback in the atomic rebuild: a follower promoting against
+	// a replica that never received data (a fresh bucket) must end up a writable,
+	// empty DB with its migrations applied — not stuck on a missing temp file.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir() // empty: nothing ever synced here
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleFollower,
+		Owner:      "follower",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.IsLeader() {
+		t.Fatal("should open as a follower")
+	}
+
+	ok, err := db.TryPromote(ctx)
+	if err != nil || !ok {
+		t.Fatalf("fresh-bucket promote should succeed: ok=%v err=%v", ok, err)
+	}
+	if !db.IsLeader() {
+		t.Fatal("should be leader after promoting against an empty replica")
+	}
+	// Writable, and migrations ran during promote so the schema exists.
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('first')`); err != nil {
+		t.Fatalf("promoted fresh DB must accept writes: %v", err)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("promoted fresh DB should hold the one row just written: n=%d err=%v", n, err)
+	}
+}
