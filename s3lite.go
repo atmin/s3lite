@@ -566,12 +566,20 @@ func (db *DB) OnRefresh(fn func()) {
 }
 
 // Sync blocks until the replica is caught up with the current database state.
-// It is a no-op when BackupTo is not configured.
+// It is a no-op when there is no replication store (BackupTo unset, or a follower
+// that does not replicate). Calling it concurrently with a demotion may return an
+// error: a role transition can close the store between the snapshot below and
+// SyncAndWait, which correctly reports that the sync did not happen.
 func (db *DB) Sync(ctx context.Context) error {
-	if db.lsDB == nil {
+	// Snapshot lsDB under mu: demote (→ nil) and promote (→ a new store) both write
+	// it under mu, so reading it unlocked is a data race with any role transition.
+	db.mu.Lock()
+	lsDB := db.lsDB
+	db.mu.Unlock()
+	if lsDB == nil {
 		return nil
 	}
-	return db.lsDB.SyncAndWait(ctx)
+	return lsDB.SyncAndWait(ctx)
 }
 
 func (db *DB) closeReplication(ctx context.Context) error {

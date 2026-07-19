@@ -1406,3 +1406,99 @@ func TestLeaseLossDemotesWriter(t *testing.T) {
 		t.Fatal("demoted writer must not report itself as leader")
 	}
 }
+
+func TestSyncRacesRoleTransition(t *testing.T) {
+	// DB.Sync reads db.lsDB, which demote (→ nil) and promote (→ a new store) both
+	// write under db.mu. A consumer calling Sync during a role transition is a data
+	// race on lsDB. The -race detector is the oracle: we assert only that nothing
+	// panics and the run stays clean while Sync is hammered across a demote and the
+	// re-promote that follows.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 200 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleAuto,
+		Owner:      "writer",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil { // publish so the re-promote has state to restore
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = db.Sync(ctx) // may error mid-transition; only the race detector matters
+			}
+		}()
+	}
+
+	demoted := make(chan error, 1)
+	db.OnDemote(func(err error) { demoted <- err })
+
+	// Steal with a short TTL: the writer loses the lease on its next renew (lsDB →
+	// nil under mu, racing the Sync reads), and the stolen lease then expires so the
+	// demoted instance re-promotes (nil → new store under mu, racing again).
+	lock.steal("thief", 100*time.Millisecond)
+
+	select {
+	case <-demoted:
+	case <-time.After(3 * time.Second):
+		close(stop)
+		wg.Wait()
+		t.Fatal("writer did not demote after the steal")
+	}
+	waitFor(t, 3*time.Second, db.IsLeader, "demoted instance to re-promote")
+
+	close(stop)
+	wg.Wait()
+}
+
+func TestSyncNoReplicaIsNoOp(t *testing.T) {
+	// Sync on an instance with no replication store — a follower never starts one —
+	// is a nil no-op. Covers the currently-untested nil-lsDB branch.
+	lock := &fakeLock{}
+	lock.steal("other-instance", time.Minute) // held elsewhere: stay a follower
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.IsLeader() {
+		t.Fatal("instance should be a follower with no replication store")
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("Sync without a replication store must be a nil no-op, got %v", err)
+	}
+}

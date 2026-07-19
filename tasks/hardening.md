@@ -98,7 +98,7 @@ promotion and refresh, though not fencing). Skip if it complicates anything.
 
 ---
 
-## Item 2 — [ ] Data race: `Sync` reads `db.lsDB` without the mutex
+## Item 2 — [x] Data race: `Sync` reads `db.lsDB` without the mutex
 
 **Claim.** `DB.Sync` (s3lite.go) reads `db.lsDB` with no lock. `demote` (via
 `stopReplicationLocked`) writes `db.lsDB = nil` under `db.mu`, and promotion
