@@ -235,7 +235,7 @@ more.
 
 ---
 
-## Item 5 — [ ] Crash-kill harness: back the README's hard-kill claim
+## Item 5 — [x] Crash-kill harness: back the README's hard-kill claim
 
 **Claim.** README: "A hard kill can lose only the sub-second window since the
 last WAL sync; a clean Close loses nothing." Zero tests kill a process. The
