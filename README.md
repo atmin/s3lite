@@ -19,7 +19,7 @@ s3lite dissolves that trade-off: the **only always-on, durable thing is the buck
 - **One binary + a bucket.** Nothing to provision. Ship the same container against AWS S3, Scaleway, Cloudflare R2, or MinIO — the bucket *is* the backing service.
 - **Correct under concurrency, with no coordinator.** A compare-and-swap **lease on `lock.json`** (`If-None-Match`/`If-Match`) guarantees exactly one writer, so rolling deploys and failover are safe by construction — no Redis, etcd, or lock service. The object store *is* the coordinator.
 
-> **Be clear about what the lease is — and isn't.** It buys single-writer safety and zero-downtime handoff: a new instance boots read-only and promotes only once the old one releases. It is **not** a turnkey read-replica cluster. Followers serve the snapshot they restored at startup and refresh only when they promote, and **nothing routes for you** — your app (or a load balancer) must direct writes to the leader and gate them on `IsLeader()`. Reading from followers scales only if stale-until-promotion data is acceptable. See [Single writer + read followers](#single-writer--read-followers-leasing).
+> **Be clear about what the lease is — and isn't.** It buys single-writer safety and zero-downtime handoff: a new instance boots read-only and promotes only once the old one releases. It is **not** a turnkey read-replica cluster. By default followers serve the snapshot they restored at startup and refresh only when they promote; set `FollowerRefreshInterval` to periodically re-restore for near-live, bounded-staleness reads (still not live WAL streaming). And **nothing routes for you** — your app (or a load balancer) must direct writes to the leader and gate them on `IsLeader()`. Reading from followers scales only if bounded-staleness data is acceptable. See [Single writer + read followers](#single-writer--read-followers-leasing).
 
 Together that's a class of app you couldn't cleanly build before — **serverless, stateful, and correct at once**: deploy-anywhere services that need a genuine transactional store but no always-on infrastructure.
 
@@ -41,7 +41,9 @@ flowchart TD
     WS --> WR[Stream WAL to S3 + renew lease every TTL/3]
     WR --> WS
 
-    F --> FS[Serve reads from the restored snapshot]
+    F --> FS[Serve reads from the local copy]
+    FS -->|"opt-in refresh tick<br/>(FollowerRefreshInterval)"| FR["Re-restore latest committed<br/>state, swap in read-only"]
+    FR --> FS
     FS --> FP{Lease freed?}
     FP -->|poll| FS
     FP -->|yes| R
@@ -64,7 +66,7 @@ litestream is the replication engine s3lite embeds; a managed Postgres is what y
 | Query path | Local file, in-process (no network hop) | Local file, in-process | Network round-trip per query |
 | Single-writer safety | Enforced by the lease (handoff, failover) | **Not enforced** — you must guarantee one writer | N/A — real multi-writer |
 | Concurrency & size | One writer; fits one node (KBs–GBs) | One writer; data fits one node | High concurrency; large datasets |
-| Read replicas | Followers, **stale until promotion** (not live) | None | Real, live read replicas |
+| Read replicas | Followers; **opt-in near-live reads** (bounded-staleness refresh), or snapshot-until-promotion by default | None | Real, live read replicas |
 | Ops | A bucket | A bucket + supervise the sidecar process | Provision, patch, back up — or pay for managed |
 | Best for | Single-writer apps (KBs to several GB) that want trivial deploy + automatic backup — idle-to-zero optional | Adding S3 durability to one existing SQLite process | Anything needing scale, concurrency, or big data |
 
