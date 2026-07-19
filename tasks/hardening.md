@@ -203,7 +203,7 @@ this change it is finally accurate.
 
 ---
 
-## Item 4 — [ ] `Generation` is documented as monotonic but resets on clean handoff
+## Item 4 — [x] `Generation` is documented as monotonic but resets on clean handoff
 
 **Claim.** The `Generation()` doc calls it "a monotonic fencing token bumped on
 each takeover". But a clean `Close` **deletes** the lock object, so the next

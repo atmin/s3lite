@@ -1727,3 +1727,79 @@ func TestPromoteFreshBucketEmptyReplica(t *testing.T) {
 		t.Fatalf("promoted fresh DB should hold the one row just written: n=%d err=%v", n, err)
 	}
 }
+
+func TestGenerationResetsOnCleanHandoff(t *testing.T) {
+	// Generation is NOT a durable cross-handoff fencing token, and this test makes
+	// that loud and intentional. It increases across takeovers only while the lock
+	// object survives (expiry/steal); a clean release deletes the lock, so the next
+	// acquirer resets to 1. The sequence a consumer sees is therefore 1 → 2 → 1 — the
+	// Generation() doc guarantees exactly this and no more.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	// A writer acquires the empty lock → generation 1.
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "w1.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "w1",
+		LeaseTTL:   200 * time.Millisecond,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := db1.Generation(); got != 1 {
+		t.Fatalf("fresh writer should be generation 1, got %d", got)
+	}
+
+	// A takeover that keeps the lock object alive (an expiry-steal) bumps the
+	// sequence: the new holder is generation 2.
+	lock.steal("w2", time.Minute)
+	lock.mu.Lock()
+	gen2 := cloneLease(lock.lease)
+	lock.mu.Unlock()
+	if gen2.Generation != 2 {
+		t.Fatalf("takeover while the lock survives should be generation 2, got %d", gen2.Generation)
+	}
+
+	// The old holder loses the lease and demotes: it now reports no lease (0).
+	waitFor(t, 3*time.Second, func() bool { return !db1.IsLeader() }, "old holder to demote")
+	if got := db1.Generation(); got != 0 {
+		t.Fatalf("demoted holder should report no lease (0), got %d", got)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The generation-2 holder releases cleanly, which DELETES the lock object.
+	if err := lock.release(gen2); err != nil {
+		t.Fatalf("clean release of the gen-2 lease: %v", err)
+	}
+	lock.mu.Lock()
+	stillHeld := lock.lease
+	lock.mu.Unlock()
+	if stillHeld != nil {
+		t.Fatal("a clean release must delete the lock object")
+	}
+
+	// The next acquirer starts over at generation 1 — the reset that is exactly why
+	// this must not be used as an external fencing token across handoffs.
+	db3, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "w3.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "w3",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db3.Close()
+	if got := db3.Generation(); got != 1 {
+		t.Fatalf("after a clean handoff the fresh writer resets to generation 1, got %d", got)
+	}
+}

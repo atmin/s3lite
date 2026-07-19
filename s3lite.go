@@ -523,9 +523,21 @@ func (db *DB) TryPromote(ctx context.Context) (bool, error) {
 	return db.tryPromoteOnce(ctx)
 }
 
-// Generation returns the lease generation — a monotonic fencing token bumped on
-// each takeover — or 0 when not holding a lease (including an unleased sole
-// writer). A consumer can use it to fence external side effects against a stale writer.
+// Generation returns the lease generation, or 0 when not holding a lease (including
+// an unleased sole writer). It is unique among concurrent contenders and increases
+// across takeovers only while the lock object survives: an expiry or a forced steal
+// bumps it (1 → 2 → 3 …), but a clean release (Close) deletes the lock, so the next
+// acquirer starts again at 1.
+//
+// Because of that reset, do not use Generation as a cross-handoff fencing token for
+// external systems: after a clean handoff a consumer sees the sequence go 1 → 2 → 1,
+// which is exactly when a stale-writer fence would need it to keep increasing. What
+// it is good for: telling apart two promotions within one instance's lifetime, and
+// logging/diagnostics.
+//
+// A durable fencing token would require persisting an epoch next to the replica data
+// (outside lock.json, which litestream's s3.Leaser owns); that is intentionally not
+// built here.
 func (db *DB) Generation() int64 {
 	db.mu.Lock()
 	defer db.mu.Unlock()
