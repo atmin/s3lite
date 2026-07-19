@@ -210,6 +210,12 @@ type DB struct {
 	// starts), so it needs no lock.
 	lastRefreshPos ltx.TXID
 
+	// promoteBackoff / promoteSkip throttle the background loop's promotion attempts
+	// after consecutive failures (e.g. a follower with a broken migration), so it does
+	// not acquire+restore on every tick. Loop-confined: only leaseLoop touches them.
+	promoteBackoff int
+	promoteSkip    int
+
 	loopCancel context.CancelFunc
 	wg         sync.WaitGroup
 }

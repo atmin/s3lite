@@ -2058,3 +2058,197 @@ func TestDoubleCloseIsIdempotent(t *testing.T) {
 		}
 	})
 }
+
+func TestBrokenMigrationPromotionDoesNotThrash(t *testing.T) {
+	// A follower whose migration is invalid acquires the free lease, restores, fails
+	// to migrate, and releases — potentially every tick, each doing a full restore.
+	// It must never become leader, must keep serving reads, must leave the lease
+	// released so a successor is not blocked, and the background loop must back off
+	// rather than acquire+restore on every single tick.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	ttl := 150 * time.Millisecond // loop ticks at ttl/3 = 50ms
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleFollower,
+		Owner:      "broken",
+		LeaseTTL:   ttl,
+		Migrations: []string{`THIS IS NOT VALID SQL`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.IsLeader() {
+		t.Fatal("should open as a follower")
+	}
+	fl := db.leaser.(*fakeLeaser)
+
+	// Across ~36 ticks: never leader, and the read-only handle keeps serving.
+	deadline := time.Now().Add(1800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if db.IsLeader() {
+			t.Fatal("a follower with a broken migration must never become leader")
+		}
+		var one int
+		if err := db.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil {
+			t.Fatalf("follower must keep serving reads while promotion fails: %v", err)
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	attempts := fl.acquireN.Load()
+
+	// The lease must end released (each failed promote releases it): a successor is
+	// never blocked by the thrashing follower.
+	waitFor(t, 2*time.Second, func() bool {
+		lock.mu.Lock()
+		defer lock.mu.Unlock()
+		return lock.lease == nil
+	}, "lease to be released after a failed promotion")
+
+	// Backoff must throttle attempts well below one per tick (~36 ticks above);
+	// without it the follower acquires + restores on every tick.
+	if attempts == 0 {
+		t.Fatal("expected the follower to attempt promotion at least once")
+	}
+	if attempts > 18 {
+		t.Fatalf("promotion not backed off: %d acquire attempts over ~36 ticks", attempts)
+	}
+}
+
+func TestConcurrentAutoOpenSingleLeader(t *testing.T) {
+	// Two RoleAuto instances opened simultaneously against one lock must resolve to
+	// exactly one leader and one serving follower, with no race on the lease CAS.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	type result struct {
+		db  *DB
+		err error
+	}
+	results := make([]result, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			db, err := Open(ctx, Config{
+				LocalPath:  filepath.Join(t.TempDir(), fmt.Sprintf("db%d.sqlite3", i)),
+				BackupTo:   replicaDir,
+				Role:       RoleAuto,
+				Owner:      fmt.Sprintf("inst-%d", i),
+				LeaseTTL:   time.Minute,
+				Migrations: []string{itemsSchema},
+			})
+			results[i] = result{db, err}
+		}(i)
+	}
+	wg.Wait()
+
+	leaders := 0
+	for i, r := range results {
+		if r.err != nil {
+			t.Fatalf("concurrent open %d failed: %v", i, r.err)
+		}
+		defer r.db.Close()
+		if r.db.IsLeader() {
+			leaders++
+		} else if err := r.db.PingContext(ctx); err != nil { // the follower must still serve
+			t.Fatalf("follower %d not serving: %v", i, err)
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("expected exactly one leader from concurrent Opens, got %d", leaders)
+	}
+}
+
+func TestPromoteAppliesFollowerMigrations(t *testing.T) {
+	// A follower can carry migrations the leader never ran; on promotion they must
+	// apply, and the pre-existing replicated data must survive the promote-restore.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema}, // base schema only
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('kept')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(); err != nil { // durable flush + release
+		t.Fatal(err)
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+		Migrations: []string{
+			itemsSchema,
+			`CREATE TABLE IF NOT EXISTS extra (k TEXT)`, // never ran on the leader
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	ok, err := db2.TryPromote(ctx)
+	if err != nil || !ok {
+		t.Fatalf("promote: ok=%v err=%v", ok, err)
+	}
+	// The follower's own migration applied at promote-time.
+	if _, err := db2.ExecContext(ctx, `INSERT INTO extra (k) VALUES ('v')`); err != nil {
+		t.Fatalf("follower migration not applied at promote: %v", err)
+	}
+	// Pre-existing replicated data survived the promote-restore.
+	var name string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM items`).Scan(&name); err != nil {
+		t.Fatalf("replicated row lost across promote: %v", err)
+	}
+	if name != "kept" {
+		t.Fatalf("expected kept, got %q", name)
+	}
+}
+
+func TestOpenFailureReleasesLease(t *testing.T) {
+	// If becomeLeaderLocked fails during Open (here, a broken migration), Open must
+	// release the just-acquired lease so it does not block a successor for a full TTL.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	_, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "writer",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{`THIS IS NOT VALID SQL`},
+	})
+	if err == nil {
+		t.Fatal("Open with a broken migration must fail")
+	}
+	lock.mu.Lock()
+	held := lock.lease
+	lock.mu.Unlock()
+	if held != nil {
+		t.Fatalf("Open failure must release the acquired lease, still held by %s", held.Owner)
+	}
+}

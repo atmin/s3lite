@@ -177,7 +177,7 @@ func (db *DB) leaseLoop(ctx context.Context) {
 					db.demote(err)
 				}
 			} else {
-				db.tryPromote(ctx)
+				db.followerTick(ctx)
 			}
 		case <-refreshC:
 			if err := db.refreshFollowerOnce(ctx); err != nil && ctx.Err() == nil {
@@ -251,20 +251,57 @@ func (db *DB) demote(cause error) {
 	// connections are rejected on next use and re-dialed query_only.
 	db.connector.setMode(true)
 
+	// Reset promotion backoff: a fresh demotion should attempt re-promotion promptly,
+	// not inherit skip ticks from an earlier failure streak. demote runs on the loop
+	// goroutine, so this is loop-confined like the fields it clears.
+	db.promoteBackoff = 0
+	db.promoteSkip = 0
+
 	db.logger.Warn("s3lite: lease lost, stopped replicating", "error", cause)
 	if onDemote != nil {
 		onDemote(cause)
 	}
 }
 
-// tryPromote is the background leaseLoop's follower-branch promotion attempt. It
+// followerTick is the background leaseLoop's follower-branch promotion attempt. It
 // routes through tryPromoteOnce (the shared, guarded path) and preserves the loop's
 // "log and move on" behaviour: a lease still held elsewhere is a silent no-op, and
 // errors during shutdown (cancelled ctx) are not logged.
-func (db *DB) tryPromote(ctx context.Context) {
-	if _, err := db.tryPromoteOnce(ctx); err != nil && ctx.Err() == nil {
-		db.logger.Warn("s3lite: promotion attempt failed", "error", err)
+//
+// It applies exponential backoff on consecutive real failures (an acquire error, or
+// a promote that acquired the lease but could not restore/migrate) so a follower that
+// cannot promote — e.g. a broken migration — does not acquire and restore on every
+// single tick. A lease merely held elsewhere is a normal no-op and resets the
+// backoff. Loop-confined: only leaseLoop calls this.
+func (db *DB) followerTick(ctx context.Context) {
+	if db.promoteSkip > 0 {
+		db.promoteSkip-- // backing off after a recent failure
+		return
 	}
+	promoted, err := db.tryPromoteOnce(ctx)
+	switch {
+	case promoted:
+		db.promoteBackoff = 0
+	case err != nil:
+		if ctx.Err() == nil {
+			db.logger.Warn("s3lite: promotion attempt failed", "error", err)
+		}
+		db.promoteBackoff++
+		db.promoteSkip = promotionSkipTicks(db.promoteBackoff)
+	default:
+		db.promoteBackoff = 0 // lease held elsewhere — normal, clear any backoff
+	}
+}
+
+// promotionSkipTicks returns how many loop ticks to skip before the next background
+// promotion attempt after `failures` consecutive failures: 1, 2, then capped at 3
+// (~one TTL, since the loop ticks at TTL/3). On-demand TryPromote is never throttled.
+func promotionSkipTicks(failures int) int {
+	const maxSkip = 3
+	if failures >= maxSkip {
+		return maxSkip
+	}
+	return 1 << (failures - 1) // failures 1 → 1, 2 → 2
 }
 
 // tryPromoteOnce is the single guarded promotion path shared by the background

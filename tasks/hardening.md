@@ -338,7 +338,7 @@ restore/refresh.
 
 ---
 
-## Item 7 — [ ] Remaining lease-lifecycle edges
+## Item 7 — [x] Remaining lease-lifecycle edges
 
 Four smaller gaps, one item, one commit — all in `lease_internal_test.go`
 unless noted.
