@@ -41,7 +41,7 @@ Use the existing seams (`newLeaserFunc`, `replicaLatestTXIDFunc`, `fakeLock`,
 
 ---
 
-## Item 1 — [ ] Fencing hole: a hung renew lets two writers overlap
+## Item 1 — [x] Fencing hole: a hung renew lets two writers overlap
 
 **Claim.** The documented invariant (Config.LeaseTTL doc, README) is: *a holder
 that cannot renew stops replicating before the TTL lets anyone else acquire.*

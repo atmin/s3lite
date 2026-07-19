@@ -89,10 +89,12 @@ func cloneLease(l *litestream.Lease) *litestream.Lease {
 }
 
 type fakeLeaser struct {
-	lock     *fakeLock
-	owner    string
-	ttl      time.Duration
-	acquireN atomic.Int64 // number of AcquireLease attempts that reached the lock
+	lock        *fakeLock
+	owner       string
+	ttl         time.Duration
+	acquireN    atomic.Int64 // number of AcquireLease attempts that reached the lock
+	renewN      atomic.Int64 // number of RenewLease attempts that reached the leaser
+	renewBlocks atomic.Bool  // model a renew into a network black hole (see RenewLease)
 }
 
 func (f *fakeLeaser) Type() string { return "fake" }
@@ -104,6 +106,14 @@ func (f *fakeLeaser) AcquireLease(ctx context.Context) (*litestream.Lease, error
 	return f.lock.acquire(f.owner, f.ttl)
 }
 func (f *fakeLeaser) RenewLease(ctx context.Context, l *litestream.Lease) (*litestream.Lease, error) {
+	f.renewN.Add(1)
+	if f.renewBlocks.Load() {
+		// A renew into a network black hole: S3 requests have no overall response
+		// timeout, so the call returns nothing until the caller's ctx is done. This
+		// is the hazard item 1 fences against — the renew must not outlive its lease.
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1263,6 +1273,102 @@ func TestFollowerRefreshConcurrentReadsSurviveSwap(t *testing.T) {
 
 	close(stop)
 	wg.Wait()
+}
+
+func TestBlockingRenewDemotesBeforeExpiry(t *testing.T) {
+	// Fencing hazard: a renew that hangs in a network black hole must not stall the
+	// lease loop past the held lease's ExpiresAt. If it did, litestream would keep
+	// pushing LTX from its own goroutines while a successor acquires at expiry, so
+	// two writers overlap on one replica. Invariant pinned: a holder that cannot
+	// confirm its renewal demotes (stops replicating, fences the handle) strictly
+	// before ExpiresAt.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	ttl := 600 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "writer",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Block every renew from the first tick on (the first tick is TTL/3 ≈ 200ms
+	// away, so setting this now beats it): the held lease never advances, so the
+	// ExpiresAt we capture is exactly the one the blocking renew must beat.
+	db.leaser.(*fakeLeaser).renewBlocks.Store(true)
+	db.mu.Lock()
+	expiresAt := db.lease.ExpiresAt
+	db.mu.Unlock()
+
+	cached := db.DB
+	demotedAt := make(chan time.Time, 1)
+	db.OnDemote(func(error) { demotedAt <- time.Now() })
+
+	select {
+	case at := <-demotedAt:
+		if !at.Before(expiresAt) {
+			t.Fatalf("demoted at %v, not before lease expiry %v: the fence fired too late, so two writers could overlap", at, expiresAt)
+		}
+	case <-time.After(ttl + time.Second):
+		t.Fatal("writer never demoted while its renew hung: the loop stalled past expiry")
+	}
+
+	if db.IsLeader() {
+		t.Fatal("demoted writer must not report itself as leader")
+	}
+	// Same handle, now fenced: writes must be rejected after demote.
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('after-demote')`); err == nil {
+		t.Fatal("demoted handle must reject writes")
+	}
+}
+
+func TestShutdownDuringRenewDoesNotDemote(t *testing.T) {
+	// The flip side of fencing: a renew interrupted by Close (the PARENT ctx is
+	// cancelled) is a shutdown, not a lost lease. It must not demote or fire
+	// OnDemote — Close alone owns teardown. This pins tryRenew's parent-ctx branch,
+	// the trap in item 1: distinguishing a shutdown from a deadline expiry.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	ttl := 600 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "writer",
+		LeaseTTL:   ttl,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var demoted atomic.Bool
+	db.OnDemote(func(error) { demoted.Store(true) })
+
+	fl := db.leaser.(*fakeLeaser)
+	fl.renewBlocks.Store(true)
+
+	// Wait until the loop is parked inside the blocking renew, then Close. The
+	// parent-ctx cancellation frees the renew well before its deadline (ExpiresAt −
+	// TTL/6) could demote, so Close — not the deadline — ends the renew.
+	waitFor(t, 3*time.Second, func() bool { return fl.renewN.Load() >= 1 }, "loop to enter renew")
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close during a hung renew should be clean, got %v", err)
+	}
+	if demoted.Load() {
+		t.Fatal("a renew interrupted by Close must not demote")
+	}
 }
 
 func TestLeaseLossDemotesWriter(t *testing.T) {

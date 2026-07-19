@@ -187,8 +187,11 @@ func (db *DB) leaseLoop(ctx context.Context) {
 	}
 }
 
-// tryRenew renews the held lease. It returns an error only when the lease is
-// genuinely lost (so the loop demotes); a renew interrupted by shutdown returns
+// tryRenew renews the held lease, bounded by a deadline derived from that lease so
+// the renew can never outlive the lease it is protecting. It returns an error when
+// the lease is lost OR cannot be confirmed before expiry — both demote the loop and
+// stop replication before a successor could acquire, which is exactly what fencing
+// requires. A renew interrupted by shutdown (the parent ctx is cancelled) returns
 // nil so we do not tear down replication out from under Close.
 func (db *DB) tryRenew(ctx context.Context) error {
 	db.mu.Lock()
@@ -198,12 +201,25 @@ func (db *DB) tryRenew(ctx context.Context) error {
 		return litestream.ErrLeaseNotHeld
 	}
 
-	newLease, err := db.leaser.RenewLease(ctx, lease)
+	// Bound the renew by the lease we currently hold: a hung renew (S3 requests have
+	// no overall response timeout) would otherwise stall this single goroutine past
+	// ExpiresAt while litestream keeps pushing from its own goroutines, and a
+	// successor acquiring at expiry would overlap us. The margin is proportional
+	// (leaseTTL/6) so short-TTL tests keep headroom; demote itself is local and fast.
+	renewCtx, cancel := context.WithDeadline(ctx, lease.ExpiresAt.Add(-db.leaseTTL/6))
+	defer cancel()
+	newLease, err := db.leaser.RenewLease(renewCtx, lease)
 	if err != nil {
+		// Distinguish the two cancellation sources by testing the PARENT ctx, not
+		// renewCtx: a parent cancellation is Close shutting us down (return nil, let
+		// Close own teardown), whereas a renewCtx deadline with a live parent means
+		// the renewal could not be confirmed before expiry and MUST demote. This is
+		// the trap — getting it backwards would either demote on every clean Close or
+		// never fence a black-holed renew.
 		if ctx.Err() != nil {
-			return nil // shutting down; let Close handle teardown
+			return nil // parent cancelled: shutting down; let Close handle teardown
 		}
-		return err
+		return err // lease lost, or renew not confirmed before expiry → caller demotes
 	}
 
 	db.mu.Lock()
