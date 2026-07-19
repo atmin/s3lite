@@ -3,6 +3,9 @@
 The default `go test ./...` suite uses `file://` replicas only and needs no
 external services.
 
+Both suites run in CI (test + integration) on every push to `master` and every
+pull request — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
 ## Integration tests (MinIO via testcontainers)
 
 Integration tests spin up a real MinIO container and exercise the `s3://`

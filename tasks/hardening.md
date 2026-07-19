@@ -370,7 +370,7 @@ applied and pre-existing replicated data survived.
 
 ---
 
-## Item 8 — [ ] CI
+## Item 8 — [x] CI
 
 There is no `.github/`. Add `.github/workflows/ci.yml`:
 
