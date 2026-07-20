@@ -217,6 +217,10 @@ blank and rely on the instance role.
 - A clean `Close` is durable: it flushes all committed writes to the replica
   before returning (bounded by `Config.ShutdownSyncTimeout`, default 30s). Only a
   *hard* crash/kill can lose the sub-second window since litestream's last sync.
+  The writer opens with `synchronous=NORMAL`: WAL mode stays crash-consistent (no
+  corruption), and the un-fsynced WAL tail it can lose on a hard crash is already
+  within that same sub-second replication window — so it costs no real durability
+  while saving an fsync per commit.
 
 ## Guarantees
 

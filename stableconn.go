@@ -51,13 +51,21 @@ func sharedDriver() (driver.Driver, error) {
 
 // buildDSN renders the connection string with per-connection pragmas so they
 // apply to every pooled connection. A follower pins query_only so it cannot
-// mutate the file; a writer sets WAL journal mode.
+// mutate the file; a writer sets WAL journal mode and synchronous=NORMAL.
+//
+// synchronous=NORMAL drops the per-commit WAL fsync (SQLite still fsyncs before a
+// checkpoint), which is safe here: WAL mode keeps the file consistent across an OS
+// crash even at NORMAL, and the only durability it costs is the un-fsynced WAL
+// tail on a hard crash/power loss. That window is already dominated by litestream's
+// asynchronous replication window (see the durability note in the README), so
+// NORMAL does not weaken s3lite's actual guarantee — it just avoids an fsync per
+// commit. It is applied only to the writer; a query_only follower never writes.
 func buildDSN(path string, readOnly bool) string {
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if readOnly {
 		return dsn + "&_pragma=query_only(1)"
 	}
-	return dsn + "&_pragma=journal_mode(WAL)"
+	return dsn + "&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 }
 
 type stableConnector struct {
