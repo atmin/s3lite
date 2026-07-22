@@ -69,19 +69,108 @@ actually recovers data.
 4. Sequencing: after tasks/incremental-follower-refresh.md — its sidecar and
    LTX machinery is this task's foundation.
 
-## Item 0 — [ ] Design spike: local position source + soundness rule
+## Item 0 — [x] Design spike: local position source + soundness rule
 
-Deliverable: this section filled in with the chosen mechanism, the rule, and
-the divergence cases it does and does not protect, each mapped to a planned
-test.
+**Result (2026-07-22): the sound signal is the lease *generation*, not a position
+comparison. No local-position read is needed — which also avoids a soundness trap in
+the position approach.** Get sign-off on this before Item 1.
 
-## Item 1 — [ ] Guarded promote
+### The key realization
 
-Restore only when the replica is ahead by the Item 0 rule; otherwise promote
-in place — flip the handle writable, start replication from the local file,
-never touch its bytes. An unreadable or ambiguous local position falls back to
-today's restore: conservative, and loud in the log. The existing atomic-swap
-path stays untouched for the restore branch (INVARIANTS.md #6/#7).
+Only the lease-holder writes (invariant #1). Therefore a **fork can only happen via a
+lease acquisition** by some other instance. Every acquire over an expired lock bumps
+`Lease.Generation` by exactly one (`s3/leaser.go`: `generation = existing.Generation +
+1`); a renew *preserves* the generation (same file, line ~147). So a whole write
+tenure carries a single generation, and any intervening writer is visible as a
+generation bump. **The generation is the lineage token.** We do not need to read or
+compare TXIDs/checksums to detect a fork; the generation already encodes "did someone
+else take the pen."
+
+### Why NOT the position/checksum approach (the task's original framing)
+
+`litestream.DB.Pos()` returns `ltx.Pos{TXID, PostApplyChecksum}` — a real lineage
+fingerprint — but it is computed from the local **L0 LTX** in the meta dir
+(`db.go` `Pos()` → `MaxLTX()`), which **lags the SQLite WAL**: a crashed writer can
+have committed frames in the WAL that litestream had not yet captured into L0. Reading
+`Pos()` would then report a TXID *behind* the replica and we would wrongly restore,
+discarding exactly the tail we are trying to save. Capturing the WAL first means
+starting replication before deciding — the thing we are trying to gate. The
+ltx-checksum lineage check has the same lag problem and is strictly more code. The
+generation signal sidesteps all of it: it never looks at positions.
+
+### Mechanism (local position source: none; instead persist the generation)
+
+The writer records the generation of the lease it holds to a small local sidecar,
+`<LocalPath>.leasegen` (decimal, fsynced), written in `becomeLeaderLocked` *before*
+accepting writes. Renews keep the same generation, so it is written once per tenure.
+For an ex-writer this file survives the crash (Open-as-follower never restores while
+`LocalPath` exists, so it is untouched). It is orthogonal to litestream's sidecars and
+is not touched by `removeLocalDBFiles`; `becomeLeaderLocked` always overwrites it with
+the current generation, so a stale value after a restore-promote is harmless.
+
+### Soundness rule (the promote decision)
+
+At promote, we have just acquired the lease at `acquiredGen` (passed into `promote()`
+by `tryPromoteOnce`). Let `persistedGen` be the value in `<LocalPath>.leasegen`.
+
+- **`acquiredGen == persistedGen + 1` → PROMOTE IN PLACE** (skip the restore). This is
+  provable self-succession: the lock we took over was still at `persistedGen`, so *no
+  other instance acquired* since our tail was written, so the replica is exactly the
+  prefix we shipped and our local file is a strict, same-lineage extension. Promoting
+  in place = start litestream on the existing local file and let it ship the unshipped
+  tail — **bit-identical to the unleased crash-restart path** (`Open` → no restore →
+  `startReplicationLocked`), which already recovers committed-but-unshipped (and even
+  committed-but-uncaptured-in-L0) writes.
+- **anything else → RESTORE** (today's behaviour): `acquiredGen >= persistedGen + 2`
+  (a successor acquired — and possibly forked — in between; the acquire alone proves
+  the risk regardless of whether it wrote), a reset to `1` after a successor's clean
+  release, or a missing/unreadable/`0` sidecar (no proof). Loud log on the fallback.
+
+**Why `+1` is airtight:** any successor acquire sets the lock to `persistedGen + 1`
+(theirs), so our subsequent acquire yields `>= persistedGen + 2`; a clean release
+deletes the lock so our acquire resets to `1` (`!= persistedGen + 1` for
+`persistedGen >= 1`). The *only* way to observe exactly `persistedGen + 1` is an
+untouched lock — no intervening acquire. This is the same generation-monotonicity the
+fencing invariant (#1/#2) already relies on; the "equal-TXID fork" nasty edge is
+covered for free, because the forking successor had to acquire (→ bump), so we never
+mistake its equal-TXID replica for ours.
+
+### Divergence cases → tests (Item 2)
+
+| Case | Generation seen | Decision | Test |
+|---|---|---|---|
+| Self-succession, no successor ever | `persistedGen + 1` | promote in place, tail shipped | *self-succession preserves the tail* |
+| Fresh writer crash before first ship | `persistedGen + 1` | promote in place (recovers data an empty-replica restore would erase) | (covered by the self-succession test with an empty replica) |
+| Successor took over + advanced replica (fork) | `>= persistedGen + 2` | restore, fork discarded | *takeover divergence still restores* |
+| Missing / unreadable `.leasegen` | n/a | restore (conservative), logged | *unreadable position → restore fallback* |
+
+### Scope note / deviation from the task's assumptions
+
+This does **not** reuse tasks/incremental-follower-refresh's `.follow` sidecar / LTX
+machinery (the task anticipated it would): the generation signal is sound without
+reading any position, so pulling in LTX-reading would be dead weight. Recorded here so
+the reviewer knows it was a deliberate call, not an oversight.
+
+## Item 1 — [ ] Guarded promote (lease-generation self-succession)
+
+Two parts:
+
+1. **Persist the generation.** In `becomeLeaderLocked`, after `startReplicationLocked`
+   succeeds and before accepting writes, write `lease.Generation` to
+   `<LocalPath>.leasegen` (fsynced). This runs on every become-leader (first promote,
+   clean handoff, expiry takeover, self-succession) so the value always reflects the
+   generation the local tail is being written under. Add a small `readLeaseGen` /
+   `writeLeaseGen` pair (mirror the existing sidecar helpers).
+
+2. **Gate the restore in `promote()`.** Compute `needRestore` from the Item 0 rule
+   (`acquiredGen == persistedGen + 1` → in place; else restore). Keep the existing
+   `swapFiles(false, …)` wrapper — it flips the handle writable and bumps the
+   generation so followers re-dial — but make its `fn` conditional: run
+   `rebuildLocalFromReplica` only when `needRestore`, otherwise a no-op that leaves the
+   local bytes intact. `becomeLeaderLocked` then starts litestream on the local file
+   and ships the tail, exactly like the unleased restart. A missing/unreadable
+   `.leasegen` falls back to restore, loud in the log. The restore branch and its
+   atomic-swap path are unchanged (INVARIANTS.md #6/#7).
 
 ## Item 2 — [ ] Tests
 
