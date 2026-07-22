@@ -131,6 +131,24 @@ and for diagnostics only.
 
 *Enforced by:* `TestGenerationResetsOnCleanHandoff`.
 
+## 9. A leased writer's crash-restart never silently rewinds its committed tail
+
+A leased writer that crashes and restarts on the same machine recovers what an
+unleased writer would: promotion keeps the local file's committed tail rather than
+restoring the replica over it, so writes acked after the last sync are not discarded by
+the instance's own successor. The guard is the lease **generation**. Only the lease
+holder writes, so a fork requires an acquire — which bumps the generation — and a
+promotion resumes the local file *in place* only when the just-acquired generation is
+exactly one past the generation the local tail was written under (recorded in
+`<LocalPath>.leasegen` while leader). Any gap (a successor acquired in between) or a
+missing/unreadable record restores instead, discarding a possibly-forked local history
+in favour of the replica lineage. This leans on the generation only where #8 says it is
+reliable: the promote path is reached only when the prior lock *survived* — was held,
+then expired — never after a clean release.
+
+*Enforced by:* `TestPromoteSelfSuccessionKeepsLocalTail`, `TestPromoteTakeoverRestores`,
+`TestPromoteMissingGenerationRestores`, `TestPromoteNeedsRestoreDecision`.
+
 ---
 
 ## The chaos soak

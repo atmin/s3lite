@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -87,6 +88,17 @@ func (fl *fakeLock) steal(owner string, ttl time.Duration) {
 		gen = fl.lease.Generation + 1
 	}
 	fl.newLeaseLocked(gen, owner, ttl)
+}
+
+// expire forces the current lease to have already lapsed, so the next acquire
+// succeeds (bumping the generation) — used to drive a promotion deterministically
+// without waiting out a real TTL.
+func (fl *fakeLock) expire() {
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+	if fl.lease != nil {
+		fl.lease.ExpiresAt = time.Now().Add(-time.Second)
+	}
 }
 
 func cloneLease(l *litestream.Lease) *litestream.Lease {
@@ -2888,5 +2900,282 @@ func TestFollowerRefreshEqualsFullRestore(t *testing.T) {
 	}
 	if len(want) != total {
 		t.Fatalf("fresh restore has %d rows, want %d", len(want), total)
+	}
+}
+
+// --- Item 2: local-ahead promote (lease-generation self-succession) -------------
+
+// simulateCrash stops an instance the way a hard kill would: goroutines are torn down
+// and files left on disk, but WITHOUT the clean shutdown's final replica sync or lease
+// release. The held lease lingers (the test expires it later), so a fresh instance
+// opening the same LocalPath reproduces the crash-restart scenario.
+func simulateCrash(t *testing.T, db *DB) {
+	t.Helper()
+	if db.loopCancel != nil {
+		db.loopCancel()
+	}
+	db.wg.Wait()
+	db.mu.Lock()
+	_ = db.stopReplicationLocked(canceledContext()) // stop the store, no final sync
+	db.closed = true                                // neuter the test's deferred Close
+	db.mu.Unlock()
+	if db.DB != nil {
+		_ = db.DB.Close() // release file locks (checkpoints the WAL into the main file)
+	}
+}
+
+// installRestoreCounter routes restoreDBFunc through a call counter (still running the
+// real restore), so a test can assert whether a promotion restored or promoted in
+// place.
+func installRestoreCounter(t *testing.T) *atomic.Int64 {
+	t.Helper()
+	var n atomic.Int64
+	prev := restoreDBFunc
+	restoreDBFunc = func(ctx context.Context, s3 S3Config, url, dest string) error {
+		n.Add(1)
+		return prev(ctx, s3, url, dest)
+	}
+	t.Cleanup(func() { restoreDBFunc = prev })
+	return &n
+}
+
+func TestPromoteNeedsRestoreDecision(t *testing.T) {
+	// The promote guard's core rule in isolation: restore unless the acquired lease is
+	// exactly one generation past the one recorded for the local tail.
+	db := &DB{
+		cfg:    Config{LocalPath: filepath.Join(t.TempDir(), "db.sqlite3")},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	genPath := db.leaseGenPath()
+
+	cases := []struct {
+		name        string
+		persisted   int64 // -1 = no sidecar
+		acquired    int64
+		wantRestore bool
+	}{
+		{"no sidecar (fresh follower) → restore", -1, 5, true},
+		{"self-succession (+1) → promote in place", 5, 6, false},
+		{"takeover (+2) → restore", 5, 7, true},
+		{"equal generation → restore", 5, 5, true},
+		{"stale lower generation → restore", 5, 4, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(genPath)
+			if tc.persisted >= 0 {
+				if err := writeLeaseGen(genPath, tc.persisted); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := db.promoteNeedsRestore(&litestream.Lease{Generation: tc.acquired}); got != tc.wantRestore {
+				t.Fatalf("promoteNeedsRestore = %v, want %v", got, tc.wantRestore)
+			}
+		})
+	}
+
+	// A torn/garbage sidecar reads as "no record" → conservative restore.
+	if err := os.WriteFile(genPath, []byte("not-a-number"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !db.promoteNeedsRestore(&litestream.Lease{Generation: 6}) {
+		t.Fatal("garbage sidecar must force a restore")
+	}
+}
+
+func TestPromoteSelfSuccessionKeepsLocalTail(t *testing.T) {
+	// A leased writer that crashes and restarts on the same machine must not restore
+	// the replica over its local file: transactions it committed after its last sync
+	// are still local and would be lost. Self-succession (no other instance acquired
+	// the lease since) promotes in place instead. Pins the core no-silent-rewind bug.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	restoreN := installRestoreCounter(t)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+
+	// Tenure at generation 1: ship [v1..v3], then commit [v4,v5] as an unshipped tail.
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 4; i <= 5; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	simulateCrash(t, w1) // lease stays held at generation 1
+
+	// Restart on the same machine: RoleAuto sees the still-held lease → read-only follower.
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if w2.IsLeader() {
+		t.Fatal("w2 must open as a follower while the stale lease is held")
+	}
+
+	lock.expire()
+	promoted, err := w2.tryPromoteOnce(ctx)
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if !promoted || !w2.IsLeader() {
+		t.Fatal("w2 should have promoted itself")
+	}
+
+	// Self-succession promotes in place: no restore, and the unshipped tail survives.
+	if n := restoreN.Load(); n != 0 {
+		t.Fatalf("self-succession must not restore; restoreDBFunc was called %d times", n)
+	}
+	var count int
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 5 {
+		t.Fatalf("self-succession lost the local tail: got %d rows, want 5", count)
+	}
+
+	// The recovered tail subsequently replicates: a forced sync ships it, and a fresh
+	// full restore of the replica now sees all five rows.
+	if err := w2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	verifyPath := filepath.Join(t.TempDir(), "verify.sqlite3")
+	if err := restoreDB(ctx, S3Config{}, replicaDir, verifyPath); err != nil { // raw restore, uncounted
+		t.Fatalf("verify restore: %v", err)
+	}
+	vdb, err := sql.Open("sqlite", verifyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vdb.Close()
+	var replicated int
+	if err := vdb.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&replicated); err != nil {
+		t.Fatal(err)
+	}
+	if replicated != 5 {
+		t.Fatalf("recovered tail did not replicate: replica restore has %d rows, want 5", replicated)
+	}
+}
+
+func TestPromoteTakeoverRestores(t *testing.T) {
+	// If another instance acquired the lease after our crash (a takeover), the replica
+	// lineage may have moved on and our local file could be a fork. Promotion must
+	// restore rather than ship the fork — detected purely by the generation gap.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	restoreN := installRestoreCounter(t)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	simulateCrash(t, w1) // lease held at generation 1
+
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	// A successor acquires (bumps the generation to 2), then its lease also lapses.
+	lock.steal("other", time.Minute)
+	lock.expire()
+
+	promoted, err := w2.tryPromoteOnce(ctx)
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if !promoted || !w2.IsLeader() {
+		t.Fatal("w2 should have promoted itself")
+	}
+	// Generation jumped to 3 (our tenure was 1), so the guard restores rather than
+	// resuming a possibly-forked local file.
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
+	}
+}
+
+func TestPromoteMissingGenerationRestores(t *testing.T) {
+	// Without a recorded generation (the sidecar is gone), self-succession cannot be
+	// proven, so promotion falls back to the conservative restore.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	restoreN := installRestoreCounter(t)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	simulateCrash(t, w1)
+	if err := os.Remove(localPath + ".leasegen"); err != nil { // lose the proof
+		t.Fatal(err)
+	}
+
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	lock.expire()
+	promoted, err := w2.tryPromoteOnce(ctx)
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if !promoted || !w2.IsLeader() {
+		t.Fatal("w2 should have promoted itself")
+	}
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("missing generation must restore exactly once; restoreDBFunc was called %d times", n)
 	}
 }

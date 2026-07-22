@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -106,6 +107,13 @@ func newS3APIClient(ctx context.Context, s3cfg S3Config) (*awss3.Client, error) 
 func (db *DB) becomeLeaderLocked(ctx context.Context, lease *litestream.Lease) error {
 	if err := db.startReplicationLocked(ctx); err != nil {
 		return err
+	}
+	// Record the generation this tenure's local writes happen under, so a later
+	// self-succession promote (crash + restart on this machine) can prove no other
+	// writer took over — see promoteNeedsRestore. Best-effort: without it, a future
+	// promote simply falls back to a conservative restore.
+	if err := writeLeaseGen(db.leaseGenPath(), lease.Generation); err != nil {
+		db.logger.Warn("s3lite: recording lease generation failed; a later self-succession will restore instead of resuming", "error", err)
 	}
 	if err := db.openWriterLocked(ctx); err != nil {
 		db.stopReplicationLocked(canceledContext())
@@ -437,13 +445,24 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 	}
 	db.mu.Unlock()
 
-	// Rebuild the local file from the replica with connection creation gated, so
-	// no query observes a half-restored database, then flip the handle writable.
-	// The stable *sql.DB is never replaced: superseded follower connections are
-	// dropped from the pool automatically once the generation advances, and any
-	// handle a caller cached stays valid.
+	// Decide whether to restore or promote in place. Provable self-succession (this
+	// machine's crashed writer coming back with no other instance having acquired the
+	// lease since) keeps its local committed tail; anything else restores. See
+	// promoteNeedsRestore.
+	needRestore := db.promoteNeedsRestore(lease)
+
+	// Gate connection creation across the (possible) rebuild, so no query observes a
+	// half-restored database, then flip the handle writable. The stable *sql.DB is
+	// never replaced: superseded follower connections are dropped from the pool once
+	// the generation advances, and any handle a caller cached stays valid.
 	swapErr := db.connector.swapFiles(false, func() error {
-		return db.rebuildLocalFromReplica(ctx)
+		if needRestore {
+			return db.rebuildLocalFromReplica(ctx)
+		}
+		// Promote in place: keep the local bytes untouched. becomeLeaderLocked starts
+		// litestream on the existing file, which ships the unshipped tail exactly like
+		// the unleased crash-restart path.
+		return nil
 	})
 	if swapErr != nil {
 		// The rebuild is atomic, so a failed restore left the local files intact:
@@ -595,6 +614,69 @@ func (db *DB) releaseQuietly(ctx context.Context, lease *litestream.Lease) {
 	if err := db.leaser.ReleaseLease(ctx, lease); err != nil &&
 		!errors.Is(err, litestream.ErrLeaseNotHeld) {
 		db.logger.Warn("s3lite: release lease failed", "error", err)
+	}
+}
+
+// leaseGenPath is the sidecar recording the lease generation the local file's
+// committed tail was written under. A self-succeeding writer (crash + restart on the
+// same machine) uses it to prove no other instance acquired the lease since — see
+// promoteNeedsRestore and INVARIANTS.md.
+func (db *DB) leaseGenPath() string { return db.cfg.LocalPath + ".leasegen" }
+
+// writeLeaseGen durably records the held lease generation beside the local file. A
+// torn or partial write is harmless: readLeaseGen treats an unparseable value as "no
+// record", which forces a conservative restore rather than a wrong promote-in-place.
+func writeLeaseGen(path string, gen int64) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(f, "%d\n", gen); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// readLeaseGen returns the recorded lease generation, or 0 if the sidecar is absent
+// or unparseable. Either way, 0 means "no proof of self-succession" → restore.
+func readLeaseGen(path string) int64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	gen, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || gen < 0 {
+		return 0
+	}
+	return gen
+}
+
+// promoteNeedsRestore decides whether a promotion must restore the replica over the
+// local file (today's default) or may promote in place and keep the local committed
+// tail. It returns false only for provable self-succession: the lease we just acquired
+// is exactly one generation past the one our local tail was written under, so no other
+// instance acquired the lease (and could have forked the replica) in between. A
+// generation gap means a successor took over — restore. A missing/unreadable sidecar
+// (a fresh follower's first promotion, or a non-leased-origin file) means no proof —
+// restore. See tasks/local-ahead-promote.md and INVARIANTS.md.
+func (db *DB) promoteNeedsRestore(lease *litestream.Lease) bool {
+	persisted := readLeaseGen(db.leaseGenPath())
+	switch {
+	case persisted > 0 && lease.Generation == persisted+1:
+		db.logger.Info("s3lite: promoting in place (self-succession); keeping local committed tail",
+			"generation", lease.Generation, "local_generation", persisted)
+		return false
+	case persisted > 0:
+		db.logger.Warn("s3lite: promote will restore; lease generation advanced past our tenure (takeover)",
+			"generation", lease.Generation, "local_generation", persisted)
+		return true
+	default:
+		return true
 	}
 }
 
