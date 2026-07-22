@@ -3122,6 +3122,11 @@ func TestPromoteSelfSuccessionKeepsLocalTail(t *testing.T) {
 	if n := restoreN.Load(); n != 0 {
 		t.Fatalf("self-succession must not restore; restoreDBFunc was called %d times", n)
 	}
+	// The outcome API agrees, so a consumer can skip its rewind-reconciliation pass on a
+	// plain restart rather than freezing on every generation > 1. See LastPromoteOutcome.
+	if out, ok := w2.LastPromoteOutcome(); !ok || out.Restored {
+		t.Fatalf("self-succession promote must report resumed-in-place; got %+v ok=%v", out, ok)
+	}
 	var count int
 	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -3205,6 +3210,11 @@ func TestPromoteTakeoverRestores(t *testing.T) {
 	// resuming a possibly-forked local file.
 	if n := restoreN.Load(); n != 1 {
 		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
+	}
+	// And the outcome API reports the restore, so a consumer treats the metadata as
+	// possibly rewound and reconciles derived state before trusting it.
+	if out, ok := w2.LastPromoteOutcome(); !ok || !out.Restored {
+		t.Fatalf("takeover promote must report restored; got %+v ok=%v", out, ok)
 	}
 }
 
@@ -3415,6 +3425,9 @@ func TestOpenDirectCleanRestartResumes(t *testing.T) {
 	if n := restoreN.Load(); n != 0 {
 		t.Fatalf("clean restart must resume in place; restoreDBFunc was called %d times", n)
 	}
+	if out, ok := w2.LastPromoteOutcome(); !ok || out.Restored {
+		t.Fatalf("clean-restart Open-direct must report resumed-in-place; got %+v ok=%v", out, ok)
+	}
 	var count int
 	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -3575,6 +3588,11 @@ func TestOpenDirectTakeoverRestores(t *testing.T) {
 	if n := restoreN.Load(); n != 1 {
 		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
 	}
+	// The successor's clean release reset the generation to 1, so the bare "generation > 1"
+	// heuristic would miss this rewind entirely — LastPromoteOutcome catches it.
+	if out, ok := w2.LastPromoteOutcome(); !ok || !out.Restored {
+		t.Fatalf("Open-direct takeover must report restored; got %+v ok=%v", out, ok)
+	}
 	var count int
 	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -3588,6 +3606,77 @@ func TestOpenDirectTakeoverRestores(t *testing.T) {
 	}
 	if forked != 0 {
 		t.Fatal("takeover resumed the forked local tail instead of restoring the replica")
+	}
+}
+
+func TestOpenFreshFirstWriterReportsRestored(t *testing.T) {
+	// A first-ever writer entry — no prior local file — has no resumed tail: its bytes
+	// are the replica lineage (or a fresh empty DB), not a kept-in-place history. The
+	// outcome API reports it as restored, erring the same conservative direction as the
+	// fork guards so a consumer reconciles derived state rather than trusting it blindly.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3") // does not exist yet
+
+	w, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if !w.IsLeader() {
+		t.Fatal("fresh writer should acquire the free lease at Open")
+	}
+	out, ok := w.LastPromoteOutcome()
+	if !ok {
+		t.Fatal("a writer Open must record a promote outcome")
+	}
+	if !out.Restored {
+		t.Fatalf("fresh first writer entry must report restored; got %+v", out)
+	}
+	if out.Generation != w.Generation() {
+		t.Fatalf("outcome generation %d disagrees with Generation() %d", out.Generation, w.Generation())
+	}
+}
+
+func TestFollowerReportsNoPromoteOutcome(t *testing.T) {
+	// A follower that has never promoted has no writer entry to report: LastPromoteOutcome
+	// returns ok=false, so a consumer never mistakes the zero value (Restored=false) for a
+	// real resume-in-place decision.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	// A live writer holds the lease so the follower cannot promote.
+	writerPath := filepath.Join(t.TempDir(), "writer.sqlite3")
+	w, err := Open(ctx, Config{
+		LocalPath: writerPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "writer", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	followerPath := filepath.Join(t.TempDir(), "follower.sqlite3")
+	f, err := Open(ctx, Config{
+		LocalPath: followerPath, BackupTo: replicaDir, Role: RoleFollower,
+		Owner: "follower", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if f.IsLeader() {
+		t.Fatal("follower must not be leader while the writer holds the lease")
+	}
+	if out, ok := f.LastPromoteOutcome(); ok {
+		t.Fatalf("a follower that never promoted must report no outcome; got %+v ok=%v", out, ok)
 	}
 }
 

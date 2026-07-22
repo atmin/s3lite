@@ -204,6 +204,32 @@ you, not the library:
   follower's local writes never replicate and are silently destroyed by the next
   restore or refresh.
 
+A consumer that keeps state *derived* from the database — caches, externally stored
+blobs, queued deletions — needs to tell two writer-entry outcomes apart: a **restore**,
+where the local file was replaced by the replica (a takeover; the previous holder's
+un-synced tail is gone — see the loss window under [Limitations](#limitations)) and must
+be treated as a possible **rewind**; versus a **resume in place**, where the local
+committed tail was kept (a same-machine restart) and nothing was discarded. Both advance
+the generation, so `Generation()` alone conflates them. `LastPromoteOutcome()` reports
+which happened:
+
+```go
+db.OnPromote(func() {
+    if out, _ := db.LastPromoteOutcome(); out.Restored {
+        // possible rewind: pause GC / destructive maintenance and reconcile
+        // derived state before trusting the metadata again
+        reconcile()
+    }
+})
+```
+
+It reflects the most recent writer entry — valid (`ok == true`) after a writer `Open`
+and after each promotion, `false` on a follower that has never promoted — and covers
+both entry paths (a loop/`TryPromote` promotion and a direct acquire at `Open`). A
+first-ever writer entry with no prior local file reads as restored, erring the same
+conservative direction as the fork guards. It is purely a signal: it changes no restore
+decision, only lets a consumer skip the reconciliation pass on a plain restart.
+
 ## Configuration
 
 s3lite itself reads no environment variables. Pass S3 settings via `S3Config`.

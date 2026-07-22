@@ -169,6 +169,17 @@ So the sub-second loss window is at risk only on real machine loss or a true fai
 never on a plain process restart or clean restart; and a genuine takeover is always
 restored, never resumed onto a fork.
 
+The instance already computes this restore-vs-resume decision at every writer entry, and
+`LastPromoteOutcome()` exposes it — `PromoteOutcome{Restored, Generation}`, valid after a
+writer `Open` and each promotion — so a consumer holding state *derived* from the database
+(caches, external blobs, queued deletions) can act on the same distinction the guards do.
+Because both outcomes carry generation > 1, `Generation()` alone conflates a rewind-bearing
+restore with a harmless resume; the accessor separates them, letting a consumer reconcile
+derived state on a genuine takeover yet skip that pass on a plain restart. It reports both
+entry paths (loop `promote` and `Open` direct acquire); a first-ever writer entry with no
+prior local file reads as restored, erring the same conservative direction as the guards.
+It is a read-only signal — it never alters a restore decision.
+
 A resumed tail must also *ship*: the resume decision is worthless if replication then
 skips what it resumed. The full-fidelity shape of that — a real `SIGKILL` leaving a
 genuinely dirty WAL, a real lease, real S3, and a successor tenure that must survive a
@@ -215,7 +226,11 @@ fidelity, across real process boundaries: `TestCrashRestartResumedTenureSurvives
 cleanly-closed tenure both survive a fresh restore) and, over a real lease and MinIO
 under the `integration` tag, `TestCrashReacquireResumedTenureSurvivesRestoreS3` (also
 asserts the reacquire resumes via self-succession). The connection pragma itself is
-pinned by `TestBuildDSN`.
+pinned by `TestBuildDSN`. The `LastPromoteOutcome()` accessor rides on the four
+restore-vs-resume tests above (each asserts the reported outcome next to its restore
+count) and is additionally pinned by `TestOpenFreshFirstWriterReportsRestored` (a
+first-ever entry reads restored) and `TestFollowerReportsNoPromoteOutcome` (`ok == false`
+before any promotion).
 
 ---
 

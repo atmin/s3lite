@@ -219,6 +219,13 @@ type DB struct {
 	isLeader bool
 	closed   bool // set by Close under mu; blocks a late promotion from resurrecting a torn-down instance
 
+	// promoteOutcome records how this instance most recently entered the writer role
+	// (restored vs resumed in place); see LastPromoteOutcome. promoteOutcomeValid gates
+	// it — false until the first writer entry, so a follower that has never promoted
+	// reports "no outcome" rather than a misleading zero value.
+	promoteOutcome      PromoteOutcome
+	promoteOutcomeValid bool
+
 	// promoteMu serialises promotion attempts (the background leaseLoop and every
 	// TryPromote caller) across the whole acquire+restore, so at most one runs at a
 	// time. It is deliberately separate from mu: the restore is slow and must not
@@ -357,6 +364,11 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 			return nil, err
 		}
 		db.isLeader = true
+		// A sole writer can never be taken over, so a resumed local file was not rewound;
+		// only a first-ever entry with no prior local file reads as restored (the same
+		// conservative default as the leased paths). Generation 0 — there is no lease.
+		db.promoteOutcome = PromoteOutcome{Restored: !localExisted, Generation: 0}
+		db.promoteOutcomeValid = true
 		return db, nil
 	}
 
@@ -381,13 +393,20 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		// could have taken over and forked the replica lineage since our tenure, restore
 		// over the local file before becoming leader; a clean/self-succession restart
 		// resumes in place. See openDirectNeedsRestore and INVARIANTS.md #9.
+		//
+		// A first-ever writer entry (no prior local file — restored from the shared
+		// replica above, or freshly created) reads as restored, erring the same
+		// conservative direction as the guard: the local bytes are the replica lineage,
+		// not a resumed tail. See LastPromoteOutcome.
+		restored := !localExisted
 		if localExisted && db.openDirectNeedsRestore(ctx, lease) {
 			if err := db.restoreLocalFromReplica(ctx); err != nil {
 				_ = db.leaser.ReleaseLease(ctx, lease)
 				return nil, err
 			}
+			restored = true
 		}
-		if err := db.becomeLeaderLocked(ctx, lease); err != nil {
+		if err := db.becomeLeaderLocked(ctx, lease, restored); err != nil {
 			_ = db.leaser.ReleaseLease(ctx, lease)
 			return nil, err
 		}
@@ -661,6 +680,40 @@ func (db *DB) Generation() int64 {
 		return 0
 	}
 	return db.lease.Generation
+}
+
+// PromoteOutcome reports how this instance entered the writer role, letting a consumer
+// that keeps state derived from the database (caches, externally stored blobs, queued
+// deletions) tell a rewind-bearing takeover from a harmless resume-in-place. Both
+// outcomes carry the same Generation > 1 signal, so Generation alone cannot separate
+// them — that is exactly the gap this type closes.
+type PromoteOutcome struct {
+	// Restored is true when writer entry replaced the local database with the replica's
+	// committed state: a takeover (a successor acquired the lease and could have forked
+	// the lineage since this instance's tenure — anything the previous holder acked but
+	// had not synced is gone), or a first-ever writer entry with no prior local file.
+	// Treat it as a possible rewind: pause destructive maintenance (e.g. garbage
+	// collection) and reconcile derived state before trusting the metadata again.
+	//
+	// It is false only for a provable resume-in-place — self-succession (a crash and
+	// restart on this machine with no takeover between) or a clean restart — where the
+	// local committed tail was kept intact and nothing was discarded, so no
+	// reconciliation is needed.
+	Restored bool
+	// Generation is the lease generation at that entry, or 0 for an unleased sole writer.
+	Generation int64
+}
+
+// LastPromoteOutcome reports how this instance most recently became the writer (see
+// PromoteOutcome). ok is true once this instance has entered the writer role — after a
+// writer Open or a later promotion — and false on a follower that has never promoted.
+// The value is stable until the next writer entry; a demotion leaves it reporting the
+// last one. Read it inside OnPromote, or after Open/TryPromote reports this instance is
+// the writer, to decide whether derived state may have been rewound.
+func (db *DB) LastPromoteOutcome() (PromoteOutcome, bool) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.promoteOutcome, db.promoteOutcomeValid
 }
 
 // OnPromote registers a callback fired after this instance becomes the writer

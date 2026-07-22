@@ -105,8 +105,10 @@ func newS3APIClient(ctx context.Context, s3cfg S3Config) (*awss3.Client, error) 
 
 // becomeLeaderLocked starts replication and opens a writable handle for a freshly
 // acquired lease. On failure it leaves replication stopped so the caller can
-// release the lease. The caller must hold db.mu (or be in single-threaded Open).
-func (db *DB) becomeLeaderLocked(ctx context.Context, lease *litestream.Lease) error {
+// release the lease. restored records whether entering the writer role replaced the
+// local file with the replica (a takeover) or resumed it in place; it is surfaced by
+// LastPromoteOutcome. The caller must hold db.mu (or be in single-threaded Open).
+func (db *DB) becomeLeaderLocked(ctx context.Context, lease *litestream.Lease, restored bool) error {
 	if err := db.startReplicationLocked(ctx); err != nil {
 		return err
 	}
@@ -130,6 +132,8 @@ func (db *DB) becomeLeaderLocked(ctx context.Context, lease *litestream.Lease) e
 	}
 	db.lease = lease
 	db.isLeader = true
+	db.promoteOutcome = PromoteOutcome{Restored: restored, Generation: lease.Generation}
+	db.promoteOutcomeValid = true
 	return nil
 }
 
@@ -489,7 +493,7 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 		db.mu.Unlock()
 		return ErrClosed
 	}
-	if err := db.becomeLeaderLocked(ctx, lease); err != nil {
+	if err := db.becomeLeaderLocked(ctx, lease, needRestore); err != nil {
 		db.connector.setMode(true) // remain a read-only follower
 		db.mu.Unlock()
 		return err

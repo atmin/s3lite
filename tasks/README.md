@@ -3,12 +3,17 @@
 Intended-to-implement units of work, each self-contained (pickable without prior
 context). Delete a file once it lands.
 
-- [promote-outcome-api.md](promote-outcome-api.md) — additive API exposing
-  whether a writer entry (promote or Open-direct) restored the replica or
-  resumed the local file in place; lets a consumer reconciling derived state
-  after a possible rewind skip the needless pass on self-succession.
+(No scheduled tasks.)
 
-(Landed: **restore-stale-litestream-state** — the restore paths
+(Landed: **promote-outcome-api** — `LastPromoteOutcome() (PromoteOutcome, bool)`
+additively exposes whether a writer entry (loop promote or `Open` direct acquire)
+restored the replica or resumed the local file in place. It is recorded in
+`becomeLeaderLocked` beside `isLeader` (and in the unleased sole-writer path), covers both
+leased entry paths, and reads a first-ever writer entry as restored — erring the same
+conservative direction as the fork guards. Because both outcomes carry generation > 1, a
+consumer reconciling derived state after a possible rewind can now skip the needless pass
+on self-succession that a bare `Generation()` check would force; INVARIANTS.md #9.
+**restore-stale-litestream-state** — the restore paths
 (`restoreLocalFromReplica`, `rebuildLocalFromReplica`) now clear litestream's
 `.<name>-litestream/` position state (`removeLitestreamMeta`) alongside the SQLite files,
 so a returning ex-leader cannot resume replication from its discarded lineage's L0 — a
