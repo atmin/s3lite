@@ -15,23 +15,28 @@ import (
 
 // TestBuildDSN pins the rendered connection strings: the defaults must stay
 // bit-identical to the pre-configurable era, the configured pragmas land only
-// on the writer, and a follower stays pure query_only.
+// on the writer, a follower stays pure query_only, and a replicated writer —
+// and only a replicated writer — disables SQLite's autocheckpoint (litestream
+// owns checkpointing; an application checkpoint racing litestream's lazy init
+// is the crash-reacquire rewind, INVARIANTS.md #9).
 func TestBuildDSN(t *testing.T) {
 	for _, tc := range []struct {
 		name                          string
-		readOnly                      bool
+		readOnly, replicated          bool
 		synchronous, txlock, wantTail string
 	}{
-		{"writer defaults", false, "", "",
+		{"writer defaults", false, false, "", "",
 			"&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"},
-		{"writer configured", false, "FULL", "immediate",
+		{"writer configured", false, false, "FULL", "immediate",
 			"&_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"},
-		{"follower ignores pragmas", true, "FULL", "immediate",
+		{"replicated writer never self-checkpoints", false, true, "", "",
+			"&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(0)"},
+		{"follower ignores pragmas", true, true, "FULL", "immediate",
 			"&_pragma=query_only(1)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			want := "db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + tc.wantTail
-			if got := buildDSN("db", tc.readOnly, tc.synchronous, tc.txlock); got != want {
+			if got := buildDSN("db", tc.readOnly, tc.synchronous, tc.txlock, tc.replicated); got != want {
 				t.Fatalf("buildDSN = %q\nwant %q", got, want)
 			}
 		})
@@ -47,7 +52,7 @@ func TestConnectHonoursContextDuringSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newStableConnector(drv, filepath.Join(t.TempDir(), "db.sqlite3"), false, "", "")
+	c := newStableConnector(drv, filepath.Join(t.TempDir(), "db.sqlite3"), false, "", "", false)
 
 	swapEntered := make(chan struct{})
 	swapRelease := make(chan struct{})

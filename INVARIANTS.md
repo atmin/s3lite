@@ -169,10 +169,33 @@ So the sub-second loss window is at risk only on real machine loss or a true fai
 never on a plain process restart or clean restart; and a genuine takeover is always
 restored, never resumed onto a fork.
 
+A resumed tail must also *ship*: the resume decision is worthless if replication then
+skips what it resumed. The full-fidelity shape of that — a real `SIGKILL` leaving a
+genuinely dirty WAL, a real lease, real S3, and a successor tenure that must survive a
+fresh restore — runs across process boundaries in the crash harness's reacquire
+scenario. Building it caught a rewind affecting every release through v0.6.0, leased
+or not: SQLite's default per-connection autocheckpoint (1000 pages) let a returning
+writer's first commits fully backfill and restart the large crash-recovered WAL before
+litestream — whose protective read lock exists only once its lazy first sync has run —
+had captured the dead tenure's tail. litestream then resumed from the restarted WAL,
+and any page allocated in the skipped span (a leaf split and its parent linkage)
+dropped out of the replicated lineage: a fresh restore could miss the crashed tenure's
+acked tail and the successor's entire synced, cleanly-closed tenure, while the
+successor's `Sync` and `Close` reported success. The fix: a replicated writer's
+connections run with `wal_autocheckpoint(0)` (see `buildDSN`), so litestream owns
+checkpointing outright — and it checkpoints only after capturing to the WAL end.
+Consumers on v0.6.0 or earlier should upgrade.
+
 *Enforced by:* `TestPromoteSelfSuccessionKeepsLocalTail`, `TestPromoteTakeoverRestores`,
 `TestPromoteMissingGenerationRestores`, `TestPromoteNeedsRestoreDecision`,
 `TestOpenDirectCleanRestartResumes`, `TestOpenDirectCrashSelfSuccessionResumesTail`,
-`TestOpenDirectTakeoverRestores`, `TestOpenDirectAmbiguousSignalRestores`.
+`TestOpenDirectTakeoverRestores`, `TestOpenDirectAmbiguousSignalRestores`. Full
+fidelity, across real process boundaries: `TestCrashRestartResumedTenureSurvivesRestore`
+(SIGKILL with a dirty WAL, same-path restart, the resumed tail and the successor's
+cleanly-closed tenure both survive a fresh restore) and, over a real lease and MinIO
+under the `integration` tag, `TestCrashReacquireResumedTenureSurvivesRestoreS3` (also
+asserts the reacquire resumes via self-succession). The connection pragma itself is
+pinned by `TestBuildDSN`.
 
 ---
 

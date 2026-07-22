@@ -64,7 +64,21 @@ func sharedDriver() (driver.Driver, error) {
 // just avoids an fsync per commit. Consumers whose own contract makes a commit
 // mean fsynced-to-disk opt into FULL. Both knobs apply only to the writer; a
 // query_only follower never writes.
-func buildDSN(path string, readOnly bool, synchronous, txlock string) string {
+//
+// A replicated writer additionally disables SQLite's autocheckpoint: litestream
+// captures committed pages from WAL frames, and a checkpoint that fully backfills
+// the WAL lets the next commit restart it — after which litestream resumes from
+// the restarted WAL and silently skips every frame it had not yet captured.
+// litestream's long-running read transaction normally pins the backfill so an
+// application checkpoint can never complete under it, but that lock exists only
+// once its lazy init has run (the first ~1s monitor tick). A writer reopening a
+// large crash-recovered WAL (SQLite's autocheckpoint threshold is 1000 pages) and
+// committing immediately lands exactly in that window — the crash-reacquire
+// rewind (TestCrashRestartResumedTenureSurvivesRestore, INVARIANTS.md #9). With
+// replication on, litestream owns checkpointing entirely (it checkpoints only
+// after capturing to the WAL end); without it there is no other checkpointer, so
+// SQLite's default stays.
+func buildDSN(path string, readOnly bool, synchronous, txlock string, replicated bool) string {
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if readOnly {
 		return dsn + "&_pragma=query_only(1)"
@@ -75,7 +89,11 @@ func buildDSN(path string, readOnly bool, synchronous, txlock string) string {
 	if synchronous == "" {
 		synchronous = "NORMAL"
 	}
-	return dsn + "&_pragma=journal_mode(WAL)&_pragma=synchronous(" + synchronous + ")"
+	dsn += "&_pragma=journal_mode(WAL)&_pragma=synchronous(" + synchronous + ")"
+	if replicated {
+		dsn += "&_pragma=wal_autocheckpoint(0)"
+	}
+	return dsn
 }
 
 type stableConnector struct {
@@ -85,6 +103,9 @@ type stableConnector struct {
 	// Config.Synchronous/TxLock; empty means buildDSN's defaults).
 	synchronous string
 	txlock      string
+	// replicated disables SQLite's autocheckpoint on writer connections, because
+	// litestream owns checkpointing when a replica is configured (see buildDSN).
+	replicated bool
 
 	gen atomic.Uint64 // bumped on every mode change / file swap
 
@@ -94,8 +115,8 @@ type stableConnector struct {
 	readOnly bool // guarded by gate
 }
 
-func newStableConnector(drv driver.Driver, path string, readOnly bool, synchronous, txlock string) *stableConnector {
-	c := &stableConnector{drv: drv, path: path, synchronous: synchronous, txlock: txlock, readOnly: readOnly}
+func newStableConnector(drv driver.Driver, path string, readOnly bool, synchronous, txlock string, replicated bool) *stableConnector {
+	c := &stableConnector{drv: drv, path: path, synchronous: synchronous, txlock: txlock, replicated: replicated, readOnly: readOnly}
 	c.gen.Store(1)
 	return c
 }
@@ -133,7 +154,7 @@ func (c *stableConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if !c.rlock(ctx) {
 		return nil, ctx.Err()
 	}
-	dsn := buildDSN(c.path, c.readOnly, c.synchronous, c.txlock)
+	dsn := buildDSN(c.path, c.readOnly, c.synchronous, c.txlock, c.replicated)
 	gen := c.gen.Load()
 	c.gate.RUnlock()
 

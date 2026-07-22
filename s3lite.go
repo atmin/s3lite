@@ -486,7 +486,7 @@ func (db *DB) ensureHandleLocked() error {
 	if err != nil {
 		return err
 	}
-	db.connector = newStableConnector(drv, db.cfg.LocalPath, false, db.cfg.Synchronous, db.cfg.TxLock)
+	db.connector = newStableConnector(drv, db.cfg.LocalPath, false, db.cfg.Synchronous, db.cfg.TxLock, db.cfg.BackupTo != "")
 	db.DB = sql.OpenDB(db.connector)
 	return nil
 }
