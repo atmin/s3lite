@@ -3,7 +3,10 @@
 Intended-to-implement units of work, each self-contained (pickable without prior
 context). Delete a file once it lands.
 
-(No scheduled tasks. See [../ideas/](../ideas/) for unscheduled design directions.)
+- [promote-outcome-api.md](promote-outcome-api.md) — additive API exposing
+  whether a writer entry (promote or Open-direct) restored the replica or
+  resumed the local file in place; lets a consumer reconciling derived state
+  after a possible rewind skip the needless pass on self-succession.
 
 (Landed: **open-direct-fork-guard** — close the sibling of local-ahead-promote: a
 returning leased writer whose lease had *already expired* by reopen takes the
