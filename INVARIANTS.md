@@ -83,15 +83,23 @@ end-state restore.
 ## 6. Follower staleness is bounded, and a failed refresh keeps current state
 
 A follower serves the snapshot it restored at `Open`. With
-`FollowerRefreshInterval` set it periodically restores the leader's latest committed
-state, bounding staleness to roughly that interval plus replication lag. A refresh
-whose restore *fails* leaves the follower serving its current state — the rebuild is
-atomic (restore into a temp file, then swap), so a failed restore never destroys the
-live database.
+`FollowerRefreshInterval` set it periodically brings itself up to the leader's latest
+committed state, bounding staleness to roughly that interval plus replication lag. The
+refresh is **incremental**: it applies only the LTX committed since the follower's
+position to a private follow file — litestream's own `Restore(Follow)` resume, driven
+by `advanceFollowFileFunc` — then atomically swaps a consistent copy of it into the
+read path. It does not re-download the whole snapshot each tick. A refresh whose
+advance *fails* leaves the follower serving its current state: the advance runs before
+(and outside) the swap, and the publish copies into a temp before touching the live
+files, so a failure never destroys the live database. Promotion and `Open` remain full
+rebuilds by design. (The incremental path relies on a litestream fork; see
+`LITESTREAM-FORK.md`.)
 
-*Enforced by:* `TestFollowerRefreshSeesNewWrites`,
-`TestFollowerRefreshRestoreFailureKeepsState`, `TestFollowerRefreshNoOpWhenUnchanged`,
+*Enforced by:* `TestFollowerRefreshSeesNewWrites`, `TestFollowerRefreshIsIncremental`,
+`TestFollowerRefreshAdvanceFailureKeepsState`, `TestFollowerRefreshNoOpWhenUnchanged`,
 `TestFollowerRefreshStaleTempFailureKeepsServing`,
+`TestFollowerRefreshReestablishesWhenFollowFileUnusable`,
+`TestFollowerRefreshEqualsFullRestore`, `TestFollowNeedsReestablish`,
 `TestPromoteRestoreFailureLeavesServingFollower`.
 
 ## 7. The stable `*sql.DB` is never reassigned
@@ -107,7 +115,8 @@ it fails at its deadline and the handle recovers once the swap releases.
 
 *Enforced by:* `TestCachedHandleSurvivesPromotion`,
 `TestCachedHandleConcurrentReadsAcrossPromotion`,
-`TestFollowerRefreshConcurrentReadsSurviveSwap`, the chaos soak's per-slot readers,
+`TestFollowerRefreshConcurrentReadsSurviveSwap`, `TestFollowerRefreshReadsStayConsistent`,
+the chaos soak's per-slot readers,
 and — for the deadline corollary — `TestConnectHonoursContextDuringSwap` and
 `TestQueryDeadlineNotStuckBehindSwap`.
 

@@ -3,11 +3,13 @@ package s3lite
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 	"github.com/superfly/ltx"
 )
 
@@ -1528,15 +1531,34 @@ func installRestoreFailSwitch(t *testing.T) *atomic.Bool {
 	return &fail
 }
 
-func TestFollowerRefreshRestoreFailureKeepsState(t *testing.T) {
-	// A refresh whose restore fails must leave the follower serving its current
-	// state, never an empty "no such table" database. The old rebuild deleted the
-	// local files before restoring, so a mid-restore failure destroyed the follower;
-	// the atomic rebuild leaves the live files untouched on failure. Once the failure
-	// clears, the follower converges to the new state.
+// installAdvanceFailSwitch routes advanceFollowFileFunc (the incremental refresh
+// seam) through a switch: while the returned flag is false the real managed follow
+// runs, once set it fails without advancing. Mirrors installRestoreFailSwitch;
+// assigned once before any refresh goroutine could read it, so flipping the atomic
+// flag is the only concurrent mutation.
+func installAdvanceFailSwitch(t *testing.T) *atomic.Bool {
+	t.Helper()
+	var fail atomic.Bool
+	prev := advanceFollowFileFunc
+	advanceFollowFileFunc = func(ctx context.Context, s3 S3Config, url, followPath string, target ltx.TXID) (ltx.TXID, error) {
+		if fail.Load() {
+			return 0, errors.New("advance boom")
+		}
+		return prev(ctx, s3, url, followPath, target)
+	}
+	t.Cleanup(func() { advanceFollowFileFunc = prev })
+	return &fail
+}
+
+func TestFollowerRefreshAdvanceFailureKeepsState(t *testing.T) {
+	// A refresh whose incremental advance fails must leave the follower serving its
+	// current state, never an empty "no such table" database. The advance runs before
+	// (and outside) the swap, and the publish copies into a temp before touching the
+	// live files, so a failure never destroys the follower. Once the failure clears,
+	// the follower converges to the new state.
 	lock := &fakeLock{}
 	installFakeLeaser(t, lock)
-	failRestore := installRestoreFailSwitch(t)
+	failAdvance := installAdvanceFailSwitch(t)
 	ctx := context.Background()
 	replicaDir := "file://" + t.TempDir()
 
@@ -1582,9 +1604,9 @@ func TestFollowerRefreshRestoreFailureKeepsState(t *testing.T) {
 		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 1
 	}, "follower to serve its Open snapshot")
 
-	// From here every refresh restore fails; advance the replica so the probe reports
-	// something new and the follower keeps trying (and failing) to restore it.
-	failRestore.Store(true)
+	// From here every refresh advance fails; advance the replica so the probe reports
+	// something new and the follower keeps trying (and failing) to catch up.
+	failAdvance.Store(true)
 	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v2')`); err != nil {
 		t.Fatal(err)
 	}
@@ -1613,11 +1635,11 @@ func TestFollowerRefreshRestoreFailureKeepsState(t *testing.T) {
 	}
 
 	// Clear the failure; the follower must now converge to the advanced state.
-	failRestore.Store(false)
+	failAdvance.Store(false)
 	waitFor(t, 5*time.Second, func() bool {
 		var n int
 		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
-	}, "follower to converge once restore recovers")
+	}, "follower to converge once the advance recovers")
 }
 
 func TestPromoteRestoreFailureLeavesServingFollower(t *testing.T) {
@@ -2468,4 +2490,403 @@ func TestFollowerRefreshStaleTempFailureKeepsServing(t *testing.T) {
 		var n int
 		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
 	}, "follower to converge once the stale temp is clearable")
+}
+
+// --- Item 3: incremental follower refresh (advanceFollowFileFunc) ---------------
+
+// startIncrementalLeader opens a leader that holds the lease for the whole test (long
+// TTL, so any follower opened against the same replica never promotes) and returns
+// the replica directory plus an insert-and-sync helper that publishes a row. It
+// installs the fake leaser, so followers opened afterward share the same lock.
+func startIncrementalLeader(t *testing.T) (replicaDir string, insert func(name string)) {
+	t.Helper()
+	installFakeLeaser(t, &fakeLock{})
+	ctx := context.Background()
+	replicaDir = t.TempDir()
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   "file://" + replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db1.Close() })
+	return replicaDir, func(name string) {
+		t.Helper()
+		if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, name); err != nil {
+			t.Fatal(err)
+		}
+		if err := db1.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFollowerRefreshIsIncremental(t *testing.T) {
+	// The marquee guarantee: a refresh applies only the LTX committed since the
+	// follower's position — it does NOT re-download the snapshot. Proof: once the
+	// follower has established its private follow file, delete every snapshot from the
+	// replica. A full restore would now be impossible (no snapshot); only incremental
+	// resume from the retained level-0/1 deltas can bring the follower forward. The
+	// follow file's TXID sidecar must also advance in place, not reset.
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+	insert("v1")
+
+	followerPath := filepath.Join(t.TempDir(), "follower.sqlite3")
+	db2, err := Open(ctx, Config{
+		LocalPath:               followerPath,
+		BackupTo:                "file://" + replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	// One refresh establishes the private follow file and catches up to v2.
+	insert("v2")
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
+	}, "follower to establish its follow file and see v2")
+
+	before, err := litestream.ReadTXIDFile(db2.followPath())
+	if err != nil || before == 0 {
+		t.Fatalf("follow file sidecar not established: txid=%s err=%v", before, err)
+	}
+
+	// Delete every snapshot from the replica. From here only incremental resume works.
+	snapDir := file.NewReplicaClient(replicaDir).LTXLevelDir(litestream.SnapshotLevel)
+	if err := os.RemoveAll(snapDir); err != nil {
+		t.Fatal(err)
+	}
+
+	insert("v3")
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 3
+	}, "follower to converge to v3 with no snapshot present (incremental resume only)")
+
+	after, err := litestream.ReadTXIDFile(db2.followPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after <= before {
+		t.Fatalf("follow file sidecar must advance in place: before=%s after=%s", before, after)
+	}
+}
+
+func TestFollowerRefreshReadsStayConsistent(t *testing.T) {
+	// Incremental refresh must never expose a torn or regressed read: a concurrent
+	// reader sees a monotonically non-decreasing row count and never an error, and the
+	// follower converges to the final state. The swap is the same atomic temp+rename as
+	// the full-restore path, now fed by the incremental follow file.
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+	insert("seed")
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                "file://" + replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	var readErr atomic.Value
+	var maxSeen atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var n int64
+			if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+				readErr.Store(err) // a torn swap would surface as "no such table" here
+				return
+			}
+			if prev := maxSeen.Load(); n < prev {
+				readErr.Store(fmt.Errorf("row count regressed: saw %d after %d", n, prev))
+				return
+			} else if n > prev {
+				maxSeen.Store(n)
+			}
+		}
+	}()
+
+	const total = 8
+	for i := 2; i <= total; i++ {
+		insert(fmt.Sprintf("v%d", i))
+		time.Sleep(15 * time.Millisecond) // let refresh ticks interleave with reads
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == total
+	}, "follower to converge to all writes")
+
+	close(stop)
+	wg.Wait()
+	if err := readErr.Load(); err != nil {
+		t.Fatalf("concurrent read saw an inconsistent state across incremental refresh: %v", err.(error))
+	}
+	if got := maxSeen.Load(); got != total {
+		t.Fatalf("reader never observed the converged state: max seen %d, want %d", got, total)
+	}
+}
+
+func TestFollowerRefreshReestablishesWhenFollowFileUnusable(t *testing.T) {
+	// When the private follow file cannot be resumed — here its TXID sidecar is gone,
+	// which drives the same rebuild fallback as the retention-pruned case — the refresh
+	// re-establishes it from a full restore and still converges. (The pruned-detection
+	// branch of followNeedsReestablish is unit-tested in TestFollowNeedsReestablish.)
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+	insert("v1")
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                "file://" + replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	insert("v2")
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
+	}, "follower to establish its follow file and see v2")
+
+	// Make the follow file unusable for resume: drop its TXID sidecar. The next advance
+	// must detect this, discard the follow file, and rebuild via a full restore.
+	if err := os.Remove(db2.followPath() + "-txid"); err != nil {
+		t.Fatal(err)
+	}
+
+	insert("v3")
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 3
+	}, "follower to re-establish and converge to v3")
+
+	if txid, err := litestream.ReadTXIDFile(db2.followPath()); err != nil || txid == 0 {
+		t.Fatalf("follow file sidecar must be re-established: txid=%s err=%v", txid, err)
+	}
+}
+
+func TestFollowNeedsReestablish(t *testing.T) {
+	// Unit-test the resume-vs-rebuild decision without a full database: a missing follow
+	// file resumes (Restore does the initial full restore itself), a follow file with no
+	// usable TXID sidecar rebuilds, a newest snapshot that begins after the saved
+	// position (retention pruned the history) rebuilds, and a snapshot covering the
+	// saved position resumes. Snapshot content is never read by the decision — only the
+	// filename's TXID range — so garbage-content marker files are sufficient.
+	ctx := context.Background()
+	replicaDir := t.TempDir()
+	client := file.NewReplicaClient(replicaDir)
+	if err := client.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replica := litestream.NewReplicaWithClient(nil, client)
+	followPath := filepath.Join(t.TempDir(), "follower.sqlite3.follow")
+
+	writeSnapshot := func(minTXID, maxTXID ltx.TXID) {
+		t.Helper()
+		dir := client.LTXLevelDir(litestream.SnapshotLevel)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ltx.FormatFilename(minTXID, maxTXID)), []byte("marker"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want bool, msg string) {
+		t.Helper()
+		got, err := followNeedsReestablish(ctx, replica, followPath)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", msg, err)
+		}
+		if got != want {
+			t.Fatalf("%s: followNeedsReestablish = %v, want %v", msg, got, want)
+		}
+	}
+
+	// Missing follow file → not a rebuild (Restore(Follow) does the initial restore).
+	check(false, "missing follow file")
+
+	// Follow file present but no usable sidecar → rebuild.
+	if err := os.WriteFile(followPath, []byte("db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	check(true, "follow file without sidecar")
+
+	// Valid sidecar at TXID 3, newest snapshot covers from TXID 1 → resume.
+	if err := litestream.WriteTXIDFile(followPath, 3); err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshot(1, 3)
+	check(false, "snapshot covers saved position")
+
+	// Newest snapshot begins at TXID 5, ahead of the saved TXID 3 → pruned → rebuild.
+	writeSnapshot(5, 5)
+	check(true, "retention pruned past saved position")
+}
+
+func TestFollowerRefreshNoGoroutineLeak(t *testing.T) {
+	// Each refresh tick starts a follow goroutine and must join it (cancelling the
+	// follow makes litestream's Restore return); goroutines must not accumulate across
+	// many ticks. Drive refreshes synchronously so the count is deterministic.
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+	insert("v1")
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+		// No auto-refresh ticker: we drive refreshFollowerOnce ourselves so each tick's
+		// follow goroutine is created and joined before we count.
+		FollowerRefreshInterval: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	const rounds = 12
+	for i := 2; i <= rounds; i++ {
+		insert(fmt.Sprintf("v%d", i))
+		if err := db2.refreshFollowerOnce(ctx); err != nil {
+			t.Fatalf("refresh %d failed: %v", i, err)
+		}
+	}
+	var n int
+	if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil || n != rounds {
+		t.Fatalf("follower did not converge across manual refreshes: got %d err %v", n, err)
+	}
+
+	// After all follow goroutines have been joined, the count must settle back near the
+	// post-warmup baseline — never grow proportionally to the number of ticks.
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+	for i := 0; i < 3; i++ { // a few more ticks after the baseline
+		insert(fmt.Sprintf("x%d", i))
+		if err := db2.refreshFollowerOnce(ctx); err != nil {
+			t.Fatalf("post-baseline refresh failed: %v", err)
+		}
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= baseline+2
+	}, fmt.Sprintf("goroutines to settle to ~baseline (%d)", baseline))
+}
+
+func TestFollowerRefreshEqualsFullRestore(t *testing.T) {
+	// The incrementally-refreshed follower's state must equal a fresh full restore of
+	// the same replica: identical rows, and integrity_check ok. This guards the
+	// follow-apply's in-place page writes (and page-1 header rewrite) against drift
+	// from litestream's own full-restore output.
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                "file://" + replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	const total = 6
+	for i := 1; i <= total; i++ {
+		insert(fmt.Sprintf("v%d", i))
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == total
+	}, "follower to converge incrementally to all writes")
+
+	// integrity_check on the incrementally-built follower.
+	var integ string
+	if err := cached.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integ); err != nil {
+		t.Fatalf("integrity_check query failed: %v", err)
+	}
+	if integ != "ok" {
+		t.Fatalf("follower integrity_check = %q, want \"ok\"", integ)
+	}
+
+	// A fresh full restore of the same replica into a scratch path.
+	freshPath := filepath.Join(t.TempDir(), "fresh.sqlite3")
+	if err := restoreDB(ctx, S3Config{}, "file://"+replicaDir, freshPath); err != nil {
+		t.Fatalf("fresh full restore failed: %v", err)
+	}
+	fresh, err := sql.Open("sqlite", freshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+
+	names := func(db *sql.DB) []string {
+		t.Helper()
+		rows, err := db.QueryContext(ctx, `SELECT name FROM items ORDER BY id`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, s)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	got, want := names(cached), names(fresh)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("incremental follower rows %v != fresh full restore rows %v", got, want)
+	}
+	if len(want) != total {
+		t.Fatalf("fresh restore has %d rows, want %d", len(want), total)
+	}
 }

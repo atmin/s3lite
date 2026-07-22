@@ -156,6 +156,87 @@ func TestLeaseMutualExclusionAndHandoffS3(t *testing.T) {
 	}
 }
 
+func TestFollowerIncrementalRefreshS3(t *testing.T) {
+	// Over real object storage (MinIO), a follower with FollowerRefreshInterval catches
+	// up to the leader's writes through the incremental follow path — proving
+	// litestream's Restore(Follow) resume works against the s3 ReplicaClient, not just
+	// the file:// client the unit tests use. The private .follow file and its advancing
+	// TXID sidecar confirm the incremental path ran (a full re-restore would write only
+	// LocalPath, never a .follow sidecar).
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	env := startMinIO(ctx, t, "followrefresh")
+	bucketURL := "s3://followrefresh/db"
+	root := t.TempDir()
+
+	leader, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath:  filepath.Join(root, "leader.sqlite3"),
+		BackupTo:   bucketURL,
+		S3:         env.cfg,
+		Role:       s3lite.RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{`CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`},
+	})
+	if err != nil {
+		t.Fatalf("open leader: %v", err)
+	}
+	defer leader.Close()
+
+	insert := func(name string) {
+		t.Helper()
+		if _, err := leader.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, name); err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+		if err := leader.Sync(ctx); err != nil {
+			t.Fatalf("sync %s: %v", name, err)
+		}
+	}
+	insert("v1")
+
+	followerPath := filepath.Join(root, "follower.sqlite3")
+	follower, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath:               followerPath,
+		BackupTo:                bucketURL,
+		S3:                      env.cfg,
+		Role:                    s3lite.RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                time.Minute,
+		FollowerRefreshInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	defer follower.Close()
+	cached := follower.DB
+
+	insert("v2")
+	waitForCond(t, 30*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 2
+	}, "follower to catch up to v2 over s3")
+
+	before, err := litestream.ReadTXIDFile(followerPath + ".follow")
+	if err != nil || before == 0 {
+		t.Fatalf("incremental follow file not established over s3: txid=%s err=%v", before, err)
+	}
+
+	insert("v3")
+	waitForCond(t, 30*time.Second, func() bool {
+		var n int
+		return cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n) == nil && n == 3
+	}, "follower to resume and catch up to v3 over s3")
+
+	after, err := litestream.ReadTXIDFile(followerPath + ".follow")
+	if err != nil {
+		t.Fatalf("read follow sidecar: %v", err)
+	}
+	if after <= before {
+		t.Fatalf("follow sidecar must advance in place across incremental ticks: before=%s after=%s", before, after)
+	}
+}
+
 func TestLeaseStealFencesWriterS3(t *testing.T) {
 	// The real-S3 replay of the fake suite's steal, validating fakeLock's fidelity to
 	// s3.Leaser over MinIO: planting a foreign, already-expired lock.json rotates the

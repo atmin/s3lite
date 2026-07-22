@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -365,11 +366,18 @@ func (db *DB) seedRefreshPos(ctx context.Context) {
 	db.lastRefreshPos = pos
 }
 
-// refreshFollowerOnce restores a follower to the replica's latest committed state
-// and swaps it in read-only, so the follower serves near-live reads. It is a no-op
-// on the writer and when the replica has not advanced since the last refresh. It
-// shares promoteMu with promotion so a refresh and a promote can never both rebuild
-// the local file at once. Called only from leaseLoop.
+// refreshFollowerOnce brings a follower up to the replica's latest committed state
+// and swaps it in read-only, so the follower serves near-live reads. It is a no-op on
+// the writer and when the replica has not advanced since the last refresh. It shares
+// promoteMu with promotion so a refresh and a promote can never both rebuild the local
+// file at once. Called only from leaseLoop.
+//
+// The refresh is incremental: it advances a private follow file by applying only the
+// LTX committed since the follower's position (litestream's own Restore(Follow)
+// resume, driven by advanceFollowFileFunc), then publishes a consistent copy of it
+// into the live read path. The advance runs outside the connector gate — readers keep
+// serving the current snapshot during the S3 fetch+apply — and only the fast local
+// copy+rename runs under the gate. Promote and Open remain full rebuilds by design.
 func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 	if db.IsLeader() { // writers own the latest state; never self-refresh
 		return nil
@@ -385,24 +393,32 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 		return err
 	}
 	if pos <= db.lastRefreshPos {
-		return nil // replica unchanged since our last restore — no swap
+		return nil // replica unchanged since our last refresh — no advance, no swap
+	}
+
+	// Advance the private follow file (no SQLite reader opens it) to the replica's
+	// latest by applying only the delta. A failure here leaves the live read file
+	// untouched — the follower keeps serving its current state — so we just return.
+	reached, err := advanceFollowFileFunc(ctx, db.cfg.S3, db.cfg.BackupTo, db.followPath(), pos)
+	if err != nil {
+		return err
 	}
 
 	swapErr := db.connector.swapFiles(true, func() error { // stays read-only
-		return db.rebuildLocalFromReplica(ctx)
+		return db.publishFollowFile(ctx, db.followPath())
 	})
 	if swapErr != nil {
-		// The rebuild is atomic: on failure the live files are untouched, so the
+		// The publish is atomic: on failure the live files are untouched, so the
 		// follower keeps serving its current state — the swap only bumped the
 		// generation, so in-flight connections re-dial against that same state.
 		return swapErr
 	}
-	db.lastRefreshPos = pos
+	db.lastRefreshPos = reached
 
 	db.mu.Lock()
 	onRefresh := db.onRefresh
 	db.mu.Unlock()
-	db.logger.Info("s3lite: follower refreshed", "txid", pos)
+	db.logger.Info("s3lite: follower refreshed", "txid", reached)
 	if onRefresh != nil {
 		onRefresh()
 	}
@@ -506,6 +522,71 @@ func (db *DB) rebuildLocalFromReplica(ctx context.Context) error {
 		return fmt.Errorf("s3lite: rebuild: rename temp into place: %w", err)
 	}
 	return precreateWAL(ctx, path)
+}
+
+// followPath is the private follow file the incremental refresh keeps current. No
+// SQLite reader ever opens it; refreshFollowerOnce publishes copies of it into the
+// live read path. It sits beside LocalPath so it shares the filesystem (the publish
+// rename must be same-FS atomic) and is cleaned up by removeLocalDBFiles / Close.
+func (db *DB) followPath() string { return db.cfg.LocalPath + ".follow" }
+
+// publishFollowFile atomically swaps a snapshot of the (already quiesced) private
+// follow file into the live read path. It mirrors rebuildLocalFromReplica's swap tail
+// exactly — restore-into-temp becomes copy-into-temp — so the two paths cannot drift,
+// and runs inside the connector gate (via refreshFollowerOnce) so no query observes a
+// half-copied database. The follow file itself is left in place as the incremental
+// base for the next tick.
+func (db *DB) publishFollowFile(ctx context.Context, followPath string) error {
+	path := db.cfg.LocalPath
+	tmp := path + ".restoring"
+
+	// A leftover temp from a crashed prior publish must not be mistaken for a fresh
+	// copy, so clear it (and its sidecars) first.
+	if err := removeLocalDBFiles(tmp); err != nil {
+		return fmt.Errorf("s3lite: publish: clear stale temp: %w", err)
+	}
+	if err := copyFile(followPath, tmp); err != nil {
+		// Copy failed without touching the live files: keep serving current state.
+		return fmt.Errorf("s3lite: publish: copy follow file: %w", err)
+	}
+
+	// Copy succeeded. Only now tear down the old files and rename the fresh copy into
+	// place. A crash between the remove and the rename leaves no local file, which the
+	// next Open restores from the replica — already safe.
+	if err := removeLocalDBFiles(path); err != nil {
+		return fmt.Errorf("s3lite: publish: clear local files: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("s3lite: publish: rename temp into place: %w", err)
+	}
+	return precreateWAL(ctx, path)
+}
+
+// copyFile copies src to dst (creating/truncating dst) and fsyncs dst, so the
+// published snapshot is durable before it is renamed into place. The follow file is a
+// standalone SQLite database — litestream's follow apply writes pages into it directly
+// and keeps no separate WAL — so copying the single file yields a complete database.
+func copyFile(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := out.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // releaseQuietly releases a lease we acquired but could not promote onto,

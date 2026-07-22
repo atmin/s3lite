@@ -19,7 +19,7 @@ s3lite dissolves that trade-off: the **only always-on, durable thing is the buck
 - **One binary + a bucket.** Nothing to provision. Ship the same container against AWS S3, Scaleway, Cloudflare R2, or MinIO — the bucket *is* the backing service.
 - **Correct under concurrency, with no coordinator.** A compare-and-swap **lease on `lock.json`** (`If-None-Match`/`If-Match`) guarantees exactly one writer, so rolling deploys and failover are safe by construction — no Redis, etcd, or lock service. The object store *is* the coordinator.
 
-> **Be clear about what the lease is — and isn't.** It buys single-writer safety and zero-downtime handoff: a new instance boots read-only and promotes only once the old one releases. It is **not** a turnkey read-replica cluster. By default followers serve the snapshot they restored at startup and refresh only when they promote; set `FollowerRefreshInterval` to periodically re-restore for near-live, bounded-staleness reads (still not live WAL streaming). And **nothing routes for you** — your app (or a load balancer) must direct writes to the leader and gate them on `IsLeader()`. Reading from followers scales only if bounded-staleness data is acceptable. See [Single writer + read followers](#single-writer--read-followers-leasing).
+> **Be clear about what the lease is — and isn't.** It buys single-writer safety and zero-downtime handoff: a new instance boots read-only and promotes only once the old one releases. It is **not** a turnkey read-replica cluster. By default followers serve the snapshot they restored at startup and refresh only when they promote; set `FollowerRefreshInterval` to periodically catch up incrementally (applying only new LTX) for near-live, bounded-staleness reads (still not continuous live WAL streaming). And **nothing routes for you** — your app (or a load balancer) must direct writes to the leader and gate them on `IsLeader()`. Reading from followers scales only if bounded-staleness data is acceptable. See [Single writer + read followers](#single-writer--read-followers-leasing).
 
 Together that's a class of app you couldn't cleanly build before — **serverless, stateful, and correct at once**: deploy-anywhere services that need a genuine transactional store but no always-on infrastructure.
 
@@ -42,7 +42,7 @@ flowchart TD
     WR --> WS
 
     F --> FS[Serve reads from the local copy]
-    FS -->|"opt-in refresh tick<br/>(FollowerRefreshInterval)"| FR["Re-restore latest committed<br/>state, swap in read-only"]
+    FS -->|"opt-in refresh tick<br/>(FollowerRefreshInterval)"| FR["Apply only new LTX<br/>(incremental), swap in read-only"]
     FR --> FS
     FS --> FP{Lease freed?}
     FP -->|poll| FS
@@ -170,14 +170,19 @@ unchanged.
 Followers serve the snapshot they restored at `Open` and always refresh on
 **promotion** (a follower restores the latest state before it starts writing). To
 also serve **near-live reads**, set `Config.FollowerRefreshInterval`: the follower
-then periodically restores the leader's latest committed state and swaps it in
+then periodically catches up to the leader's latest committed state and swaps it in
 read-only, with staleness bounded by roughly the interval plus the leader's
-replication lag. A tick that finds nothing new does no work, so idle followers are
-cheap; register `OnRefresh` to bust caches when new state lands. Left at zero (the
-default) a follower serves only its `Open` snapshot — unchanged behaviour. The
-refresh replaces the local file underneath the stable handle, so a read that is
-in flight at the swap may see a rare, retryable error (the connection is dropped
-and re-dialed); keep the interval modest and retry.
+replication lag. The catch-up is **incremental** — each tick fetches and applies only
+the LTX committed since the follower's position, not a full snapshot — so a large
+database on a short interval stays cheap. A tick that finds nothing new does no work,
+so idle followers are cheap too; register `OnRefresh` to bust caches when new state
+lands. Left at zero (the default) a follower serves only its `Open` snapshot —
+unchanged behaviour. The refresh replaces the local file underneath the stable handle,
+so a read that is in flight at the swap may see a rare, retryable error (the connection
+is dropped and re-dialed); keep the interval modest and retry.
+
+> The incremental refresh depends on a small litestream fork (a follow-mode
+> resume fix); see [LITESTREAM-FORK.md](LITESTREAM-FORK.md).
 
 The embedded `*sql.DB` is **stable for the life of the instance** — it is created
 once and never reassigned, even across promote/demote. Take it once
@@ -212,8 +217,9 @@ blank and rely on the instance role.
   enforce it with a lease — see [Single writer + read followers](#single-writer--read-followers-leasing).
 - Restore happens on Open — cold starts pay this cost, proportional to DB size (sub-second for small DBs, longer for multi-GB). Keep one instance warm if a large-DB restore would hurt first-request latency.
 - Followers serve their Open-time snapshot and only refresh on promotion unless
-  `FollowerRefreshInterval` is set, which gives bounded-staleness near-live reads
-  by periodically restoring the latest state (not incremental WAL tailing yet).
+  `FollowerRefreshInterval` is set, which gives bounded-staleness near-live reads by
+  periodically applying only the LTX committed since the follower's position
+  (incremental, but interval-driven — not continuous live WAL tailing).
 - A clean `Close` is durable: it flushes all committed writes to the replica
   before returning (bounded by `Config.ShutdownSyncTimeout`, default 30s). Only a
   *hard* crash/kill can lose the sub-second window since litestream's last sync.

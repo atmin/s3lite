@@ -109,16 +109,19 @@ type Config struct {
 	// empty, litestream generates one (hostname:pid). Ignored without an s3:// BackupTo.
 	Owner string
 
-	// FollowerRefreshInterval, when > 0, makes a follower periodically restore the
+	// FollowerRefreshInterval, when > 0, makes a follower periodically catch up to the
 	// leader's latest committed state from BackupTo and serve it read-only, giving
 	// near-live reads with staleness bounded by roughly this interval plus the
-	// leader's replication lag. When 0 (the default) a follower serves the snapshot
-	// it restored at Open and refreshes only on promotion — bit-identical to prior
-	// behaviour. Ignored without an s3:// BackupTo (nothing to follow) and while
-	// this instance is the writer. Best-effort: a failed refresh is logged and the
-	// follower keeps serving its current state. A refresh that lands new data swaps
-	// the local file underneath the stable handle, so an in-flight read spanning the
-	// swap may see a rare, retryable error; ticks find nothing new do no swap.
+	// leader's replication lag. The catch-up is incremental — it fetches and applies
+	// only the LTX committed since the follower's position, not a full snapshot each
+	// tick — so it stays cheap even for a large database on a short interval. When 0
+	// (the default) a follower serves the snapshot it restored at Open and refreshes
+	// only on promotion — bit-identical to prior behaviour. Ignored without an s3://
+	// BackupTo (nothing to follow) and while this instance is the writer. Best-effort:
+	// a failed refresh is logged and the follower keeps serving its current state. A
+	// refresh that lands new data swaps the local file underneath the stable handle, so
+	// an in-flight read spanning the swap may see a rare, retryable error; ticks that
+	// find nothing new do no swap.
 	FollowerRefreshInterval time.Duration
 }
 
@@ -559,6 +562,12 @@ func (db *DB) CloseContext(ctx context.Context) error {
 		save(db.DB.Close())
 	}
 	save(db.closeReplication(ctx))
+	// Drop the private follower cache (only followers created it; a no-op otherwise).
+	// Best-effort: a leftover .follow just gets re-established or resumed next run, so a
+	// removal error must not fail Close.
+	if err := removeLocalDBFiles(db.followPath()); err != nil {
+		db.logger.Warn("s3lite: removing follow cache failed", "error", err)
+	}
 	// Release the lease last — after the final sync — so a successor only takes
 	// over once our writes are durable. Best effort: a lost lease is already gone.
 	if db.isLeader && db.lease != nil && db.leaser != nil {
