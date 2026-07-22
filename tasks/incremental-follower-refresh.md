@@ -1,19 +1,23 @@
 # Incremental follower refresh — apply only new LTX instead of re-restoring the full DB
 
-**Status: SHELVED (2026-07-19).** The design spike ran (see Item 0 below) and
-settled the approach: the two litestream-native options are both dead ends, and the
-only workable path is a self-contained LTX-apply reimplemented inside s3lite
-(Option (iii), proven feasible). That is a ~150–200-line port of litestream internals
-with ongoing drift risk, so the call was made to **shelve rather than build it now**
-and keep today's full-restore refresh. Everything needed to resume is in this file —
+**Status: ACTIVE (unshelved 2026-07-22; shelved 2026-07-19).** The design spike
+ran (see Item 0 below) and settled the approach: the two litestream-native options
+are both dead ends, and the only workable path is a self-contained LTX-apply
+reimplemented inside s3lite (Option (iii), proven feasible). It was shelved over
+the port's size and drift risk; unshelved now that a consumer needs a chatty,
+short-interval follower. The pinned litestream is still v0.5.14 — the version the
+spike verified — so Item 0's findings stand without a re-probe; re-run the probe
+only if the pin moves before Items 1–4 land. Everything needed is in this file —
 Item 0 records the evidence; Items 1–4 are the concrete (iii) plan. No prior
-conversation context is assumed. Line references are against the working tree at task
-creation — trust function/type names over line numbers.
+conversation context is assumed. Line references are against the working tree at
+task creation — trust function/type names over line numbers.
 
-**To resume:** re-confirm Item 0's findings still hold against the pinned litestream
-version (re-run the probe sketch in Item 0), then build Items 1–4. If litestream has
-since exposed a bounded apply or fixed the resume validation (see Item 0, Option C),
-prefer that — it deletes most of the port.
+**Option C's calculus has changed:** waiting on upstream is no longer the only
+form it can take — carrying a litestream *fork* with the small resume-validation
+fix (Item 0, Option A's blocker) is on the table, which would shrink this task to
+a per-tick `Restore(Follow)` resume and delete most of the (iii) port. Weigh
+fork-and-fix against the port at pickup; file the upstream issue either way and
+drop the fork when upstream lands it.
 
 ## Why
 
