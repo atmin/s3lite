@@ -3,6 +3,11 @@
 Intended-to-implement units of work, each self-contained (pickable without prior
 context). Delete a file once it lands.
 
+- [crash-reacquire-rewind-repro.md](crash-reacquire-rewind-repro.md) — a
+  consumer on v0.5.0 observed a fresh restore missing a successor's entire
+  synced tenure after SIGKILL → same-path reacquire → clean Close; build the
+  full-fidelity repro (real kill, real S3, dirty WAL) and either land it as
+  the missing #9 regression or fix what is still live.
 - [promote-outcome-api.md](promote-outcome-api.md) — additive API exposing
   whether a writer entry (promote or Open-direct) restored the replica or
   resumed the local file in place; lets a consumer reconciling derived state
