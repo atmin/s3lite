@@ -13,6 +13,31 @@ import (
 // swap gate for however long a full S3 restore takes, and a caller-bounded Connect
 // must honour its context instead of queueing behind it.
 
+// TestBuildDSN pins the rendered connection strings: the defaults must stay
+// bit-identical to the pre-configurable era, the configured pragmas land only
+// on the writer, and a follower stays pure query_only.
+func TestBuildDSN(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		readOnly                      bool
+		synchronous, txlock, wantTail string
+	}{
+		{"writer defaults", false, "", "",
+			"&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"},
+		{"writer configured", false, "FULL", "immediate",
+			"&_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"},
+		{"follower ignores pragmas", true, "FULL", "immediate",
+			"&_pragma=query_only(1)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := "db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" + tc.wantTail
+			if got := buildDSN("db", tc.readOnly, tc.synchronous, tc.txlock); got != want {
+				t.Fatalf("buildDSN = %q\nwant %q", got, want)
+			}
+		})
+	}
+}
+
 func TestConnectHonoursContextDuringSwap(t *testing.T) {
 	// A swap holds the gate for writing while it rebuilds the local file. A Connect
 	// racing it with a deadline must return ctx.Err() promptly — and the gate must
@@ -22,7 +47,7 @@ func TestConnectHonoursContextDuringSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newStableConnector(drv, filepath.Join(t.TempDir(), "db.sqlite3"), false)
+	c := newStableConnector(drv, filepath.Join(t.TempDir(), "db.sqlite3"), false, "", "")
 
 	swapEntered := make(chan struct{})
 	swapRelease := make(chan struct{})

@@ -70,6 +70,100 @@ func TestOpenWALMode(t *testing.T) {
 	}
 }
 
+// TestConfigPragmas: Synchronous and TxLock reach every writer connection —
+// observed through SQLite itself, not the DSN string. With TxLock "immediate"
+// a bare Begin takes the write lock at BEGIN, so a second handle's BEGIN
+// IMMEDIATE fails busy while the transaction is open.
+func TestConfigPragmas(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.sqlite3")
+
+	// Lowercase on purpose: values are case-insensitive and normalized.
+	db, err := s3lite.Open(ctx, s3lite.Config{LocalPath: path, Synchronous: "full", TxLock: "immediate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var level int
+	if err := db.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&level); err != nil {
+		t.Fatal(err)
+	}
+	if level != 2 { // 2 = FULL
+		t.Fatalf("PRAGMA synchronous = %d, want 2 (FULL)", level)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	raw, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, "BEGIN IMMEDIATE"); err == nil {
+		t.Fatal("BEGIN IMMEDIATE on a second connection succeeded — the open Begin holds no write lock, so _txlock=immediate did not apply")
+	}
+}
+
+// TestConfigPragmasDefault pins the deferred default: without TxLock, a bare
+// Begin holds no write lock, so a second connection's BEGIN IMMEDIATE works.
+func TestConfigPragmasDefault(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.sqlite3")
+
+	db, err := s3lite.Open(ctx, s3lite.Config{LocalPath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var level int
+	if err := db.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&level); err != nil {
+		t.Fatal(err)
+	}
+	if level != 1 { // 1 = NORMAL
+		t.Fatalf("PRAGMA synchronous = %d, want 1 (NORMAL)", level)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	raw, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("BEGIN IMMEDIATE alongside a deferred Begin: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestConfigPragmasInvalid: a typo fails Open with the field named, before
+// any file or replica work happens.
+func TestConfigPragmasInvalid(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		field string
+		cfg   s3lite.Config
+	}{
+		{"Synchronous", s3lite.Config{LocalPath: "x", Synchronous: "TOTAL"}},
+		{"TxLock", s3lite.Config{LocalPath: "x", TxLock: "eventually"}},
+	} {
+		_, err := s3lite.Open(ctx, tc.cfg)
+		if err == nil || !strings.Contains(err.Error(), tc.field) {
+			t.Fatalf("Open with bad %s = %v, want an error naming the field", tc.field, err)
+		}
+	}
+}
+
 func TestOpenReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "test.sqlite3")

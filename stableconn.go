@@ -51,26 +51,40 @@ func sharedDriver() (driver.Driver, error) {
 
 // buildDSN renders the connection string with per-connection pragmas so they
 // apply to every pooled connection. A follower pins query_only so it cannot
-// mutate the file; a writer sets WAL journal mode and synchronous=NORMAL.
+// mutate the file; a writer sets WAL journal mode plus the configurable
+// synchronous level and transaction-begin mode (Config.Synchronous/TxLock,
+// pre-normalized by Open — empty means the defaults below).
 //
-// synchronous=NORMAL drops the per-commit WAL fsync (SQLite still fsyncs before a
-// checkpoint), which is safe here: WAL mode keeps the file consistent across an OS
-// crash even at NORMAL, and the only durability it costs is the un-fsynced WAL
-// tail on a hard crash/power loss. That window is already dominated by litestream's
-// asynchronous replication window (see the durability note in the README), so
-// NORMAL does not weaken s3lite's actual guarantee — it just avoids an fsync per
-// commit. It is applied only to the writer; a query_only follower never writes.
-func buildDSN(path string, readOnly bool) string {
+// The default synchronous=NORMAL drops the per-commit WAL fsync (SQLite still
+// fsyncs before a checkpoint), which is safe here: WAL mode keeps the file
+// consistent across an OS crash even at NORMAL, and the only durability it costs
+// is the un-fsynced WAL tail on a hard crash/power loss. That window is already
+// dominated by litestream's asynchronous replication window (see the durability
+// note in the README), so NORMAL does not weaken s3lite's actual guarantee — it
+// just avoids an fsync per commit. Consumers whose own contract makes a commit
+// mean fsynced-to-disk opt into FULL. Both knobs apply only to the writer; a
+// query_only follower never writes.
+func buildDSN(path string, readOnly bool, synchronous, txlock string) string {
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	if readOnly {
 		return dsn + "&_pragma=query_only(1)"
 	}
-	return dsn + "&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	if txlock != "" {
+		dsn += "&_txlock=" + txlock
+	}
+	if synchronous == "" {
+		synchronous = "NORMAL"
+	}
+	return dsn + "&_pragma=journal_mode(WAL)&_pragma=synchronous(" + synchronous + ")"
 }
 
 type stableConnector struct {
 	drv  driver.Driver
 	path string
+	// Writer-connection pragmas, fixed for the connector's life (normalized
+	// Config.Synchronous/TxLock; empty means buildDSN's defaults).
+	synchronous string
+	txlock      string
 
 	gen atomic.Uint64 // bumped on every mode change / file swap
 
@@ -80,8 +94,8 @@ type stableConnector struct {
 	readOnly bool // guarded by gate
 }
 
-func newStableConnector(drv driver.Driver, path string, readOnly bool) *stableConnector {
-	c := &stableConnector{drv: drv, path: path, readOnly: readOnly}
+func newStableConnector(drv driver.Driver, path string, readOnly bool, synchronous, txlock string) *stableConnector {
+	c := &stableConnector{drv: drv, path: path, synchronous: synchronous, txlock: txlock, readOnly: readOnly}
 	c.gen.Store(1)
 	return c
 }
@@ -119,7 +133,7 @@ func (c *stableConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if !c.rlock(ctx) {
 		return nil, ctx.Err()
 	}
-	dsn := buildDSN(c.path, c.readOnly)
+	dsn := buildDSN(c.path, c.readOnly, c.synchronous, c.txlock)
 	gen := c.gen.Load()
 	c.gate.RUnlock()
 

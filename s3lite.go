@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,27 @@ type Config struct {
 	// Migrations are SQL strings executed in order on every Open. Each must be
 	// idempotent (e.g. CREATE TABLE IF NOT EXISTS) — there is no version table.
 	Migrations []string
+
+	// Synchronous sets PRAGMA synchronous on every writer connection: "OFF",
+	// "NORMAL", "FULL", or "EXTRA" (case-insensitive). Empty means "NORMAL",
+	// the default documented in the README's durability note: WAL keeps the
+	// local file crash-consistent either way, and the un-fsynced WAL tail
+	// NORMAL can lose on a hard crash is already within the replication
+	// window. Set "FULL" when the application's own contract makes a commit
+	// mean fsynced-to-local-disk (e.g. a server whose reply promises stable
+	// storage) — that closes the local-crash window; the replication window
+	// to the bucket remains. Followers are unaffected: their connections are
+	// query_only and never write.
+	Synchronous string
+
+	// TxLock sets how transactions opened through database/sql (Begin,
+	// BeginTx) start on writer connections: "deferred" (SQLite's default),
+	// "immediate", or "exclusive" (case-insensitive) — the driver's _txlock
+	// DSN parameter. A writer whose every transaction mutates wants
+	// "immediate": the write lock is taken at BEGIN, so contention surfaces
+	// as a busy_timeout wait up front instead of SQLITE_BUSY at the first
+	// write inside the transaction. Followers are unaffected.
+	TxLock string
 
 	// S3 configures s3:// replicas. Applies to both RestoreFrom and BackupTo.
 	// Empty fields fall back to the AWS SDK's default credential and region chain
@@ -239,6 +261,17 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	if cfg.LocalPath == "" {
 		return nil, errors.New("s3lite: LocalPath is required")
 	}
+	// Normalize the connection pragmas up front so a typo fails Open loudly
+	// instead of silently producing a broken DSN on the first connection.
+	var err error
+	if cfg.Synchronous, err = normalizeChoice("Synchronous", cfg.Synchronous,
+		strings.ToUpper, "OFF", "NORMAL", "FULL", "EXTRA"); err != nil {
+		return nil, err
+	}
+	if cfg.TxLock, err = normalizeChoice("TxLock", cfg.TxLock,
+		strings.ToLower, "deferred", "immediate", "exclusive"); err != nil {
+		return nil, err
+	}
 
 	if err := os.MkdirAll(filepath.Dir(cfg.LocalPath), 0o755); err != nil {
 		return nil, err
@@ -352,6 +385,21 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 }
 
+// normalizeChoice validates a case-insensitive Config choice against its valid
+// set, returning the canonical form (empty stays empty — the field's default).
+func normalizeChoice(field, value string, canon func(string) string, valid ...string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	v := canon(value)
+	for _, ok := range valid {
+		if v == ok {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("s3lite: invalid %s %q (valid: %s)", field, value, strings.Join(valid, ", "))
+}
+
 // precreateWAL creates the database in WAL mode when it does not yet exist, so
 // litestream starts on an existing WAL-mode file. Without this, litestream would
 // start on a non-WAL database and the app's PRAGMA journal_mode=WAL would switch
@@ -416,7 +464,7 @@ func (db *DB) ensureHandleLocked() error {
 	if err != nil {
 		return err
 	}
-	db.connector = newStableConnector(drv, db.cfg.LocalPath, false)
+	db.connector = newStableConnector(drv, db.cfg.LocalPath, false, db.cfg.Synchronous, db.cfg.TxLock)
 	db.DB = sql.OpenDB(db.connector)
 	return nil
 }
