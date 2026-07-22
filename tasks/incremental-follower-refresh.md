@@ -1,23 +1,21 @@
 # Incremental follower refresh — apply only new LTX instead of re-restoring the full DB
 
-**Status: ACTIVE (unshelved 2026-07-22; shelved 2026-07-19).** The design spike
-ran (see Item 0 below) and settled the approach: the two litestream-native options
-are both dead ends, and the only workable path is a self-contained LTX-apply
-reimplemented inside s3lite (Option (iii), proven feasible). It was shelved over
-the port's size and drift risk; unshelved now that a consumer needs a chatty,
-short-interval follower. The pinned litestream is still v0.5.14 — the version the
-spike verified — so Item 0's findings stand without a re-probe; re-run the probe
-only if the pin moves before Items 1–4 land. Everything needed is in this file —
-Item 0 records the evidence; Items 1–4 are the concrete (iii) plan. No prior
-conversation context is assumed. Line references are against the working tree at
-task creation — trust function/type names over line numbers.
-
-**Option C's calculus has changed:** waiting on upstream is no longer the only
-form it can take — carrying a litestream *fork* with the small resume-validation
-fix (Item 0, Option A's blocker) is on the table, which would shrink this task to
-a per-tick `Restore(Follow)` resume and delete most of the (iii) port. Weigh
-fork-and-fix against the port at pickup; file the upstream issue either way and
-drop the fork when upstream lands it.
+**Status: ACTIVE — approach DECIDED (Option C fork + Option A managed follow).**
+Unshelved 2026-07-22; shelved 2026-07-19. History: the original spike (Item 0) found
+both litestream-native options dead and settled on a ~150–200-line self-contained
+LTX-apply port (Option (iii)); it was shelved over the port's size/drift risk.
+**That decision is now superseded.** Option C (a litestream fork carrying the small
+resume-validation fix) was taken: the fix landed on fork `atmin/litestream`, s3lite
+consumes it via `go.mod` `replace` at tag **`v0.5.15-s3lite.1`** (pin moved v0.5.14
+→ v0.5.15), and a **re-probe against the consumed v0.5.15 code passed** (2026-07-22,
+see Item 0). With the fix in place **Option A is unblocked and chosen**: drive
+litestream's own `Restore(Follow)` resume against a private follow-file and publish
+via the existing copy-and-swap. **This deletes the (iii) port entirely** — litestream's
+`applyNewLTXFiles` already does the level-0 apply *and* the gap-fill (`fillFollowGap`)
+we were going to reimplement. See `LITESTREAM-FORK.md` for the fork's sync/exit
+workflow; file/track the upstream PR and drop the fork when it lands. Line references
+are against the working tree at task creation — trust function/type names over line
+numbers.
 
 ## Why
 
@@ -100,14 +98,34 @@ commit per item; do not commit unless asked.
 
 ## Item 0 — [x] Design spike: choose the integration approach
 
-**Result (2026-07-19): Option (iii) — a self-contained bounded LTX-apply inside
-s3lite — is the only workable approach. Options A and B are dead ends, proven below.
-Decision: shelve (see status header); build Items 1–4 as the (iii) plan when picked
-up.** The findings were verified against **litestream v0.5.14** (the pinned version)
-with a throwaway probe test (`Restore(Follow)` behavior + a manual delta-apply);
-re-run an equivalent probe before trusting these across a version bump.
+**Original result (2026-07-19), against litestream v0.5.14:** Option (iii) — a
+self-contained bounded LTX-apply inside s3lite — was the only workable approach;
+Options A and B were dead ends (proven below). Decision then: shelve.
 
-### A — per-tick `Restore(Follow)` resume — DEAD (resume validation)
+**SUPERSEDED by the v0.5.15 re-probe (2026-07-22).** The pin moved to v0.5.15 with
+the fork resume-fix (`atmin/litestream@v0.5.15-s3lite.1`), so the spike was re-run
+against the exact consumed code. Result: **Option A is now viable and is the chosen
+approach; the (iii) port is dropped.** Evidence, all confirmed against the consumed
+module:
+- The fork's regression test `TestReplica_Restore_Follow_ResumeAheadOfSnapshot`
+  reproduces Item 0's exact scenario (follow-file ahead of a snapshot marker) and now
+  **passes** — resume is no longer rejected. The snapshot marker is written as garbage
+  bytes yet resume succeeds, proving resume applies only the delta and never
+  re-reads/re-downloads the snapshot.
+- litestream's `applyNewLTXFiles` (replica.go) already implements the level-0 apply
+  loop **and** the gap-fill-from-higher-levels case (`fillFollowGap`) — the ~150–200
+  lines (iii) was going to port. Driving `Restore(Follow)` gets all of it, plus the
+  page-1 header rewrite, truncate-to-commit, and `-txid` sidecar advance, for free.
+- The goroutine + cancel-once-caught-up mechanism the s3lite integration needs is
+  itself exercised by `TestReplica_Restore_Follow_ContextCancellation` (clean
+  `Sync`+`Close`, returns nil on ctx cancel) and `TestReplica_Restore_Follow_StaleTXID`
+  (the pruned/retention fallback error path). Full follow suite: green.
+
+**The chosen design is written up in "Item 0.5 — the decided approach" below; Items
+1–4 are re-planned around it.** The A/B/(iii) analysis that follows is kept for the
+record — A's "DEAD" verdict is what the re-probe overturned.
+
+### A — per-tick `Restore(Follow)` resume — DEAD (resume validation) → **OVERTURNED by the v0.5.15 re-probe; now the CHOSEN path (see Item 0.5)**
 
 `Restore` refuses to resume a follow-file whose saved `-txid` is **ahead of the
 latest snapshot** (`replica.go` ~line 591: `txid > latestSnapshot.MaxTXID` →
@@ -120,7 +138,7 @@ TXID 1, follow-file at TXID 11 → resume rejected with exactly that error. (The
 looks like a genuine litestream bug: a position ahead of the last snapshot is
 perfectly resumable while the intervening level-0/1 LTX still exist. See Option C.)
 
-### B — persistent `Follow` goroutine + consistent copy — DEAD (in-process locks)
+### B — persistent `Follow` goroutine + consistent copy — DEAD (in-process locks) → **now MOOT: Item 0.5 quiesces (cancels) the follow before copying, so there is no concurrent mutation to snapshot; the resume-fix makes restarting cheap**
 
 To copy the continuously-mutated private follow-file at a consistent boundary we'd
 need to cooperate with litestream's apply lock. In v0.5.14 `applyLTXFile` **does**
@@ -133,7 +151,7 @@ snapshot this way. Restarting the goroutine to quiesce it re-hits the Option A r
 bug. (This also corrects "The catch" above: the in-place mutation is lock-guarded for
 *cross-process* SQLite readers, but that guard is useless to us in-process.)
 
-### (iii) — self-contained bounded apply — WORKS (proven)
+### (iii) — self-contained bounded apply — WORKS (proven) → **DROPPED in favor of Option A; kept for reference. Its whole body (the level-0 apply loop + `fillFollowGap`) is what litestream already implements internally, so Option A reuses it instead of porting it.**
 
 Drive the apply ourselves from `saved+1`, so the resume validation never runs and
 there is no concurrent writer to race the copy. Using only **public** primitives —
@@ -200,33 +218,99 @@ s3lite → **the answer** (proven). On gating: no size/opt-in threshold — the 
 already opt-in via `FollowerRefreshInterval`; if (iii) is built, make it the default
 refresh behavior with a full-restore fallback (decided during the spike).
 
-**Original recommendation (Option A) was REJECTED by the spike** — see the Item 0
-result above. It cannot work because per-tick `Restore(Follow)` resume is rejected once
-a snapshot sits behind the follow-file's position (the normal steady state).
+**Original recommendation (Option A) was REJECTED by the 2026-07-19 spike, then
+UN-REJECTED by the 2026-07-22 re-probe** once the fork resume-fix removed the
+"ahead of snapshot" rejection. It is now the chosen approach — see Item 0.5.
 
 ---
 
-## Item 1 — [ ] (Option (iii)) Incremental apply on a private follow-file
+## Item 0.5 — [x] The decided approach (Option A via managed `Restore(Follow)`)
 
-Implement the self-contained bounded apply (Item 0 result): advance
-`<LocalPath>.follow` from its `-txid` to the replica's latest by reading level-0 LTX
-after `saved` via `ReplicaClient.LTXFiles`/`OpenLTXFile` + `ltx.Decoder`, `WriteAt`-ing
-pages and `Truncate`-ing to `Commit*pageSize`, then advancing the sidecar with
-`WriteTXIDFile`. **Port the gap-fill-from-higher-levels case too** (`fillFollowGap`):
-when level-0 files after `saved` were already compacted away, bridge from levels 1..8.
-Route it through a package-var seam `advanceFollowFileFunc` (mirror `restoreDBFunc`) so
-tests can inject failures and count work. The writer must never run this (it owns the
-state); it is follower-only. Fresh follow-file (first tick / after a pruned fallback):
-a full restore into `.follow` establishes the base + sidecar.
+**Chosen 2026-07-22.** Keep a private follow-file that **no SQLite reader ever
+opens**, kept current by litestream's own `Restore(Follow)`, and publish to readers
+via the existing copy-and-swap. s3lite owns only the private-file lifecycle and the
+swap (both already invariant-covered); litestream owns the LTX apply (its tested
+responsibility).
+
+**State:** `<LocalPath>.follow` + its `<LocalPath>.follow-txid` sidecar (private
+cache). The live read file and its swap machinery are unchanged.
+
+**Per refresh tick (`refreshFollowerOnce`):**
+1. Probe the replica's latest TXID (`replicaLatestTXIDFunc`). If the `.follow` sidecar
+   (`litestream.ReadTXIDFile`) already equals it, skip — no-op tick (today's
+   `lastRefreshPos` optimization, re-keyed onto the follow sidecar).
+2. Advance `.follow` to that target by running, in a goroutine with a cancellable ctx,
+   `litestream.Restore{OutputPath: <.follow>, Follow: true, FollowInterval: <short,
+   e.g. 25–50ms>}`. Existing `.follow`+valid sidecar → **resumes incrementally**
+   (the fix; no snapshot download). Missing `.follow` (first tick, or after a pruned
+   fallback) → initial full restore into `.follow`+sidecar, then follow.
+3. Poll `ReadTXIDFile(.follow)` until it reaches the step-1 target (or the goroutine
+   returns an error); then **cancel the ctx and join** the goroutine. On ctx cancel
+   the follow loop `Sync`s, `Close`s, and returns nil at a commit boundary
+   (litestream `replica.go` `follow`; proven by
+   `TestReplica_Restore_Follow_ContextCancellation`). The private file is now
+   quiescent — no concurrent writer to race (this is why Option B's fcntl problem is
+   moot).
+4. Copy the quiescent `.follow` into `<LocalPath>.restoring` and swap it in under
+   `swapFiles` exactly as today (atomic temp+rename; invariants #6/#7 preserved).
+   Advance `lastRefreshPos`.
+
+**Retention/pruned fallback:** if step 2 returns litestream's "saved TXID … behind the
+earliest snapshot … history has been pruned" error (`replica.go` resume validation;
+covered by `TestReplica_Restore_Follow_StaleTXID`), discard `.follow`+sidecar and do a
+full restore into `.follow` to re-establish the base, then continue.
+
+**Failure isolation:** any error in steps 2–3 leaves the live read file untouched (no
+swap) → keep serving current state (invariant #6). Retry next tick.
+
+**Seams / ownership:** replace the (iii) `advanceFollowFileFunc` (a hand-ported apply)
+with a thinner `advanceFollowFileFunc` package var wrapping steps 2–3 (drive
+`Restore(Follow)` + catch up + cancel/join). Tests inject failures / count work through
+it; `restoreDBFunc` still drives the full-restore fallback and initial establish. This
+is **follower-only** — the writer owns its state and must never run it. `.follow` +
+sidecar are private caches: delete them in `CloseContext` (best-effort, after the loop
+stops) and cover them in `removeLocalDBFiles` (which already handles `<path>-txid`).
+
+**Known costs / things to verify while building (were not in the port):**
+- *Per-tick goroutine lifecycle* — start / cancel / bounded-join with no leak (assert
+  in Item 3).
+- *"Caught up" is polled to a target captured at tick start* — if the leader commits
+  more mid-catch-up we publish up to target and get the rest next tick (bounded; fine).
+- *First-apply latency* — the follow ticker waits one `FollowInterval` before its first
+  apply, so use a short interval for catch-up. Per-tick cost; acceptable.
+- *Header rewrite* — litestream's apply rewrites page-1 to DELETE journal mode and
+  randomizes the schema cookie. Should match today's restore output (readers re-dial
+  the swapped inode and re-read schema anyway); the Item 3 "equals a full restore" test
+  is the guard — verify journal mode / integrity there.
+- *Copy cost* — still a local file copy per tick (as the port planned); consider
+  reflink/`clonefile` on supported FS.
+
+---
+
+## Item 1 — [ ] Managed follow-file advance (`advanceFollowFileFunc`)
+
+Implement the seam from Item 0.5: advance `<LocalPath>.follow` to the replica's latest
+by driving `litestream.Restore{OutputPath: <.follow>, Follow: true, FollowInterval:
+<short>}` in a goroutine with a cancellable ctx, polling `litestream.ReadTXIDFile` to
+the target captured by the caller, then cancelling + joining the goroutine at a commit
+boundary. Do **not** reimplement the apply — litestream's `applyNewLTXFiles` already
+does level-0 apply + `fillFollowGap`. Handle the two non-steady cases: (a) missing
+`.follow` → the same `Restore(Follow)` call does the initial full restore + sidecar
+before following; (b) pruned/retention → detect litestream's "behind the earliest
+snapshot" resume error, discard `.follow`+sidecar, re-establish via a full restore.
+Route through a package-var seam `advanceFollowFileFunc` (mirror `restoreDBFunc`) so
+tests can inject failures / count work. **Follower-only** — the writer owns its state
+and must never call it. Guarantee a bounded join with no goroutine leak on cancel,
+error, or ctx timeout.
 
 ## Item 2 — [ ] Wire it into `refreshFollowerOnce`, preserving atomic swaps
 
 Replace the full re-restore in the refresh path with: advance the private follow-file
-by the delta, then swap a consistent copy into place under `swapFiles` exactly as
-today. A **failed** incremental apply must leave the live read file untouched (keep
-serving current state — invariant #6). If the replica has pruned past the follower's
-position (retention), fall back to a full restore. Keep `lastRefreshPos` / the
-no-op-tick skip working.
+by the delta (Item 1), then copy a quiescent snapshot of it into `<LocalPath>.restoring`
+and swap under `swapFiles` exactly as today. A **failed** advance must leave the live
+read file untouched (keep serving current state — invariant #6). Pruned-past-follower
+(retention) → the Item 1 fallback re-establishes, then the tick proceeds. Keep
+`lastRefreshPos` / the no-op-tick skip working, re-keyed onto the `.follow` sidecar.
 
 ## Item 3 — [ ] Tests
 
@@ -234,16 +318,22 @@ Reuse `lease_internal_test.go` seams:
 - *Refresh applies only the delta:* after an initial restore, a leader commits a small
   batch and syncs; the follower's next refresh must fetch/apply only the new LTX, not
   re-download the snapshot. Assert via a seam that counts LTX fetches (or bytes, or the
-  `-txid` advancing) — not a full-snapshot fetch.
+  `.follow` sidecar advancing) — not a full-snapshot fetch. (litestream's own
+  `TestReplica_Restore_Follow_ResumeAheadOfSnapshot` already proves the primitive is
+  incremental; this test pins the *s3lite integration*.)
 - *Reads stay consistent across incremental refresh:* reuse the monotonic-count and
   concurrent-reads-survive-swap patterns; no torn reads, converges to the new state.
-- *Failed incremental apply keeps serving current state:* inject an apply failure and
-  assert the follower keeps answering with its pre-failure data (invariant #6), then
-  recovers when the injection clears.
+- *Failed advance keeps serving current state:* inject a failure through
+  `advanceFollowFileFunc` and assert the follower keeps answering with its pre-failure
+  data (invariant #6), then recovers when the injection clears.
 - *Retention pruned → full-restore fallback:* simulate the replica pruning past the
-  follower's `-txid`; the refresh must fall back to a full restore and converge.
+  follower's `.follow` sidecar; the refresh must fall back to a full restore and
+  converge.
+- *No goroutine leak:* the per-tick follow goroutine always joins on cancel/error/
+  timeout (e.g. `goleak`, or a counted seam).
 - *Correctness vs full restore:* the incremental final state equals a fresh full
-  restore's state (`integrity_check` ok, same rows).
+  restore's state (`integrity_check` ok, same rows) — this is also the guard for the
+  page-1 header/journal-mode rewrite noted in Item 0.5.
 
 ## Item 4 — [ ] Docs + invariants
 
@@ -254,6 +344,10 @@ Reuse `lease_internal_test.go` seams:
 - `Config.FollowerRefreshInterval` doc comment: note refresh is now incremental.
 - `INVARIANTS.md` #6: keep the staleness/keeps-current-state wording accurate under
   the new mechanism, and name the new test(s).
+- Note the litestream fork dependency: refresh now relies on the resume-fix carried in
+  `atmin/litestream@v0.5.15-s3lite.1` (see `LITESTREAM-FORK.md`). When the upstream PR
+  lands, follow that doc's exit steps and confirm this path still passes on stock
+  litestream.
 
 ---
 
