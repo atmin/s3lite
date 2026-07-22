@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -534,6 +535,9 @@ func (db *DB) rebuildLocalFromReplica(ctx context.Context) error {
 		if err := removeLocalDBFiles(path); err != nil {
 			return fmt.Errorf("s3lite: rebuild: clear local files: %w", err)
 		}
+		if err := removeLitestreamMeta(path); err != nil {
+			return fmt.Errorf("s3lite: rebuild: clear litestream state: %w", err)
+		}
 		return precreateWAL(ctx, path)
 	} else if err != nil {
 		return fmt.Errorf("s3lite: rebuild: stat temp: %w", err)
@@ -544,6 +548,13 @@ func (db *DB) rebuildLocalFromReplica(ctx context.Context) error {
 	// file, which the next Open restores from the replica — already safe.
 	if err := removeLocalDBFiles(path); err != nil {
 		return fmt.Errorf("s3lite: rebuild: clear local files: %w", err)
+	}
+	// Discard litestream's local position state too (#9): the old L0 LTX files under
+	// the meta directory belong to the lineage we just replaced, and left in place can
+	// resume replication ahead of / diverged from the restored replica. See
+	// removeLitestreamMeta and restoreLocalFromReplica (the Open-direct sibling).
+	if err := removeLitestreamMeta(path); err != nil {
+		return fmt.Errorf("s3lite: rebuild: clear litestream state: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("s3lite: rebuild: rename temp into place: %w", err)
@@ -764,6 +775,14 @@ func (db *DB) restoreLocalFromReplica(ctx context.Context) error {
 	if err := removeLocalDBFiles(path); err != nil {
 		return fmt.Errorf("s3lite: open restore: clear local files: %w", err)
 	}
+	// Discard litestream's local position state too (#9): a restore replaces this
+	// machine's lineage with the replica's, so the old L0 LTX files under the meta
+	// directory — the position db.Pos() resumes from — are stale. Left in place they
+	// can sit ahead of the restored replica and ship the discarded lineage's tail back
+	// over it. See removeLitestreamMeta.
+	if err := removeLitestreamMeta(path); err != nil {
+		return fmt.Errorf("s3lite: open restore: clear litestream state: %w", err)
+	}
 	if err := restoreDBFunc(ctx, db.cfg.S3, db.cfg.BackupTo, path); err != nil {
 		return fmt.Errorf("s3lite: open restore: %w", err)
 	}
@@ -811,7 +830,9 @@ func readCleanShutdown(path string) (ltx.TXID, bool) {
 }
 
 // removeLocalDBFiles deletes the SQLite file and its litestream sidecars so a
-// restore can write a fresh copy. Missing files are not an error.
+// restore can write a fresh copy. Missing files are not an error. It deliberately
+// leaves litestream's meta directory alone — restore paths that discard the local
+// lineage clear that separately via removeLitestreamMeta, while resume paths keep it.
 func removeLocalDBFiles(path string) error {
 	for _, p := range []string{path, path + "-wal", path + "-shm", path + "-txid"} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
@@ -819,6 +840,32 @@ func removeLocalDBFiles(path string) error {
 		}
 	}
 	return nil
+}
+
+// litestreamMetaPath returns litestream's per-database meta directory beside path,
+// where it keeps the L0 LTX files that encode the local replication position. It
+// mirrors litestream.NewDB's derivation exactly (filepath.Split then
+// "."+file+MetaDirSuffix), reusing litestream's own constant so the two never drift.
+func litestreamMetaPath(path string) string {
+	dir, file := filepath.Split(path)
+	return filepath.Join(dir, "."+file+litestream.MetaDirSuffix)
+}
+
+// removeLitestreamMeta deletes litestream's meta directory for path, discarding the
+// recorded local replication position (the L0 LTX files db.Pos() resumes from).
+//
+// Only the restore paths call it, and only because they discard this machine's local
+// lineage in favour of the replica's. Left in place, that stale position can sit ahead
+// of the restored replica; litestream's next writer would then ship the discarded
+// lineage's tail back over the replica (litestream currently masks this by
+// re-snapshotting when its verify sees the WAL no longer matches the stale L0, but that
+// masking is a heuristic we must not depend on — see INVARIANTS.md #9).
+//
+// Resume paths (self-succession, clean restart) must NOT call it: there the meta dir IS
+// the position that makes the kept local tail ship. os.RemoveAll treats a missing
+// directory as success.
+func removeLitestreamMeta(path string) error {
+	return os.RemoveAll(litestreamMetaPath(path))
 }
 
 // canceledContext returns an already-cancelled context, used to stop the store

@@ -186,10 +186,30 @@ connections run with `wal_autocheckpoint(0)` (see `buildDSN`), so litestream own
 checkpointing outright — and it checkpoints only after capturing to the WAL end.
 Consumers on v0.6.0 or earlier should upgrade.
 
+The mirror of "a resumed tail must ship" is "a *restored* lineage must ship cleanly."
+A restore discards this machine's local lineage for the replica's, so it clears not just
+the SQLite files but litestream's local position — the L0 LTX files under
+`.<name>-litestream/` that `db.Pos()` resumes from (`removeLitestreamMeta`, called only
+by the two restore paths, never by a resume). Left behind, that position belongs to the
+discarded lineage and can sit *ahead of* the restored replica (a crashed leader's monitor
+captures WAL frames into local L0 before the separate replica upload ships them); the
+next writer would then resume from it and ship the discarded tail back over the
+successor's lineage — a fork, not mere loss. litestream happens to mask this today (its
+`verify` re-snapshots when the freshly-restored WAL no longer matches the stale L0), but
+that is a heuristic with a known resume unsoundness, so s3lite clears the position
+outright rather than depend on it; recovery then routes through litestream's
+well-tested "database behind replica" path (local position empty ⇒ refetched from the
+replica), giving a clean, gap-free onward lineage. Resume paths (self-succession, clean
+restart) must *keep* the meta directory — there it **is** the position that makes the
+kept local tail ship.
+
 *Enforced by:* `TestPromoteSelfSuccessionKeepsLocalTail`, `TestPromoteTakeoverRestores`,
 `TestPromoteMissingGenerationRestores`, `TestPromoteNeedsRestoreDecision`,
 `TestOpenDirectCleanRestartResumes`, `TestOpenDirectCrashSelfSuccessionResumesTail`,
-`TestOpenDirectTakeoverRestores`, `TestOpenDirectAmbiguousSignalRestores`. Full
+`TestOpenDirectTakeoverRestores`, `TestOpenDirectAmbiguousSignalRestores`. The restore
+paths' position-clearing (a stale L0 ahead of the restored replica must not survive to
+ship the discarded lineage) is pinned by `TestOpenDirectTakeoverClearsStaleLitestreamState`
+and `TestPromoteTakeoverClearsStaleLitestreamState`. Full
 fidelity, across real process boundaries: `TestCrashRestartResumedTenureSurvivesRestore`
 (SIGKILL with a dirty WAL, same-path restart, the resumed tail and the successor's
 cleanly-closed tenure both survive a fresh restore) and, over a real lease and MinIO

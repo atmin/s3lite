@@ -2939,6 +2939,84 @@ func installRestoreCounter(t *testing.T) *atomic.Int64 {
 	return &n
 }
 
+// metaMaxLTXTXID reports the highest L0 TXID recorded in litestream's meta directory
+// beside localPath — the position litestream resumes replication from (db.Pos()). It
+// reads the on-disk meta dir directly (a throwaway litestream.DB shares no state with a
+// live writer), so a test can assert whether a restore left the local position stale.
+func metaMaxLTXTXID(t *testing.T, localPath string) ltx.TXID {
+	t.Helper()
+	_, max, err := litestream.NewDB(localPath).MaxLTX()
+	if err != nil {
+		t.Fatalf("read meta L0 position: %v", err)
+	}
+	return max
+}
+
+// captureLocalLTXTail commits a forked tail on a leased writer and captures it into the
+// LOCAL litestream L0 WITHOUT uploading, leaving the local position several txids ahead
+// of the replica. litestream's DB.Sync captures WAL frames into local L0; the replica
+// upload is a separate step (SyncAndWait's second half), so driving DB.Sync alone models
+// a writer whose monitor captured frames it had not yet shipped when it crashed. The rows
+// are named "fork-N" so a later restore can prove none of them leaked into the replica.
+func captureLocalLTXTail(t *testing.T, ctx context.Context, db *DB, ns ...int) {
+	t.Helper()
+	for _, i := range ns {
+		if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("fork-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.lsDB.Sync(ctx); err != nil { // local capture only; no replica upload
+			t.Fatalf("local L0 capture: %v", err)
+		}
+	}
+}
+
+// assertReplicaLineage does a fresh full restore of the replica and asserts it holds
+// exactly the surviving lineage after a takeover-restore + post-takeover writes: the
+// pre-crash prefix (v1..v3), the successor's row, and the post-takeover rows — and none
+// of the crashed leader's forked tail. It is the end-to-end onward-replication check the
+// stale-state tests share (Open-direct and promote).
+func assertReplicaLineage(t *testing.T, ctx context.Context, replicaURL string) {
+	t.Helper()
+	verifyPath := filepath.Join(t.TempDir(), "verify.sqlite3")
+	if err := restoreDB(ctx, S3Config{}, replicaURL, verifyPath); err != nil { // raw restore, uncounted
+		t.Fatalf("verify restore: %v", err)
+	}
+	vdb, err := sql.Open("sqlite", verifyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vdb.Close()
+
+	var forked int
+	if err := vdb.QueryRowContext(ctx, `SELECT count(*) FROM items WHERE name LIKE 'fork-%'`).Scan(&forked); err != nil {
+		t.Fatal(err)
+	}
+	if forked != 0 {
+		t.Fatalf("the discarded lineage's forked tail reached the replica: %d fork-* rows present", forked)
+	}
+
+	want := []string{"v1", "v2", "v3", "successor-4", "post-6", "post-7"}
+	rows, err := vdb.QueryContext(ctx, `SELECT name FROM items ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("replica lineage after takeover-restore = %v, want %v", got, want)
+	}
+}
+
 func TestPromoteNeedsRestoreDecision(t *testing.T) {
 	// The promote guard's core rule in isolation: restore unless the acquired lease is
 	// exactly one generation past the one recorded for the local tail.
@@ -3128,6 +3206,113 @@ func TestPromoteTakeoverRestores(t *testing.T) {
 	if n := restoreN.Load(); n != 1 {
 		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
 	}
+}
+
+func TestPromoteTakeoverClearsStaleLitestreamState(t *testing.T) {
+	// The promote-path sibling of TestOpenDirectTakeoverClearsStaleLitestreamState: a
+	// takeover restore driven through the background loop's promote
+	// (rebuildLocalFromReplica) must clear the crashed lineage's litestream position too,
+	// so the returning writer cannot ship its discarded, forked tail over the successor's
+	// lineage. Same stale-state hazard, different entry point. INVARIANTS.md #9.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+	successorPath := filepath.Join(t.TempDir(), "successor.sqlite3")
+
+	// Our tenure (generation 1): ship [v1..v3], then a forked tail captured into LOCAL L0
+	// only, leaving the local position several txids ahead of the replica.
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	captureLocalLTXTail(t, ctx, w1, 4, 5, 6)
+	staleLocal := metaMaxLTXTXID(t, localPath)
+	simulateCrash(t, w1) // lease lingers at generation 1
+
+	// w2 restarts on the same path while the stale lease is still held → opens as a
+	// read-only follower.
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w2.IsLeader() {
+		t.Fatal("w2 must open as a follower while the stale lease is held")
+	}
+
+	// The stale lease lapses; a successor on another path takes over (generation 2),
+	// extends the replica by a single row, and finishes cleanly (releasing the lease).
+	lock.expire()
+	succ, err := Open(ctx, Config{
+		LocalPath: successorPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "other", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := succ.ExecContext(ctx, `INSERT INTO items (name) VALUES ('successor-4')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := succ.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replicaPos, err := replicaLatestTXIDFunc(ctx, S3Config{}, replicaDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleLocal <= replicaPos {
+		t.Fatalf("test setup: local L0 (%d) must be ahead of the replica (%d) to exercise the stale-state hazard",
+			staleLocal, replicaPos)
+	}
+
+	// w2 promotes into the free lease; the generation gap forces a restore.
+	restoreN := installRestoreCounter(t)
+	promoted, err := w2.tryPromoteOnce(ctx)
+	if err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	if !promoted || !w2.IsLeader() {
+		t.Fatal("w2 should have promoted itself")
+	}
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
+	}
+
+	// The fix under test: the promote restore cleared the stale meta directory, so the
+	// local position no longer sits ahead of the replica lineage.
+	if got := metaMaxLTXTXID(t, localPath); got > replicaPos {
+		t.Fatalf("promote restore left litestream position stale: local L0 max txid %d is ahead of replica %d",
+			got, replicaPos)
+	}
+
+	// Onward replication is correct: post-takeover writes ship, forked tail never does.
+	for i := 6; i <= 7; i++ {
+		if _, err := w2.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("post-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w2.Sync(ctx); err != nil {
+		t.Fatalf("w2 sync: %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("w2 close: %v", err)
+	}
+	assertReplicaLineage(t, ctx, replicaDir)
 }
 
 func TestPromoteMissingGenerationRestores(t *testing.T) {
@@ -3404,6 +3589,107 @@ func TestOpenDirectTakeoverRestores(t *testing.T) {
 	if forked != 0 {
 		t.Fatal("takeover resumed the forked local tail instead of restoring the replica")
 	}
+}
+
+func TestOpenDirectTakeoverClearsStaleLitestreamState(t *testing.T) {
+	// Restore-stale-litestream-state (tasks/restore-stale-litestream-state.md): a
+	// returning ex-leader taking the Open-direct restore path must discard its OLD
+	// lineage's litestream position, not just the SQLite files. Here the crashed leader
+	// left a local L0 sitting SEVERAL txids AHEAD of the replica (WAL frames its monitor
+	// captured but had not shipped). After the takeover-restore that stale position must
+	// be gone — left in place litestream would resume replication from it and could ship
+	// the discarded lineage's tail back over the successor's. INVARIANTS.md #9.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+	successorPath := filepath.Join(t.TempDir(), "successor.sqlite3")
+
+	// Our tenure (generation 1): ship [v1..v3], then commit a forked tail captured into
+	// LOCAL L0 only. Local L0 now sits several txids ahead of the replica.
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	captureLocalLTXTail(t, ctx, w1, 4, 5, 6)
+	staleLocal := metaMaxLTXTXID(t, localPath)
+	simulateCrash(t, w1)
+
+	// A successor on another path takes over the expired lease, extends the replica by a
+	// single row (well short of our stale local position), and finishes cleanly.
+	lock.expire()
+	succ, err := Open(ctx, Config{
+		LocalPath: successorPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "other", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := succ.ExecContext(ctx, `INSERT INTO items (name) VALUES ('successor-4')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := succ.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replicaPos, err := replicaLatestTXIDFunc(ctx, S3Config{}, replicaDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleLocal <= replicaPos {
+		t.Fatalf("test setup: local L0 (%d) must be ahead of the replica (%d) to exercise the stale-state hazard",
+			staleLocal, replicaPos)
+	}
+
+	// We return via Open-direct takeover-restore.
+	restoreN := installRestoreCounter(t)
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w2.IsLeader() {
+		t.Fatal("w2 should acquire the free lease directly at Open")
+	}
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
+	}
+
+	// The fix under test: the restore cleared the stale meta directory, so the local
+	// position no longer sits ahead of the replica lineage. Before the fix it stayed at
+	// the crashed lineage's txid (ahead of the replica) — the shippable fork.
+	if got := metaMaxLTXTXID(t, localPath); got > replicaPos {
+		t.Fatalf("restore left litestream position stale: local L0 max txid %d is ahead of replica %d "+
+			"(the discarded lineage's tail is resumable)", got, replicaPos)
+	}
+
+	// Onward replication is correct: post-takeover writes ship, and none of the forked
+	// tail ever reaches the replica.
+	for i := 6; i <= 7; i++ {
+		if _, err := w2.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("post-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w2.Sync(ctx); err != nil {
+		t.Fatalf("w2 sync: %v", err)
+	}
+	if err := w2.Close(); err != nil { // durable flush — checked, unlike the older takeover tests
+		t.Fatalf("w2 close: %v", err)
+	}
+	assertReplicaLineage(t, ctx, replicaDir)
 }
 
 func TestOpenDirectAmbiguousSignalRestores(t *testing.T) {
