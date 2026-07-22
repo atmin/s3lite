@@ -319,6 +319,14 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 	leased := db.leaser != nil
 
+	// Whether the local file already existed at Open, captured before the
+	// restore-if-missing and precreateWAL blocks below (both can create it). The
+	// Open-direct fork guard (openDirectNeedsRestore) only applies when a leased writer
+	// resumes a pre-existing local file; a fresh restore/create is the replica lineage by
+	// construction and needs no guard.
+	_, statErr := os.Stat(cfg.LocalPath)
+	localExisted := statErr == nil
+
 	// Leased instances restore from the shared replica (BackupTo) when no explicit
 	// RestoreFrom is given — that replica is the source of truth for the group.
 	restoreFrom := cfg.RestoreFrom
@@ -367,6 +375,17 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 				return db, nil
 			}
 			return nil, err // RoleWriter: surface LeaseExistsError; both: surface others
+		}
+		// Open-direct fork guard: acquiring here (the prior lease had already expired)
+		// would otherwise resume the existing local file unconditionally. If a successor
+		// could have taken over and forked the replica lineage since our tenure, restore
+		// over the local file before becoming leader; a clean/self-succession restart
+		// resumes in place. See openDirectNeedsRestore and INVARIANTS.md #9.
+		if localExisted && db.openDirectNeedsRestore(ctx, lease) {
+			if err := db.restoreLocalFromReplica(ctx); err != nil {
+				_ = db.leaser.ReleaseLease(ctx, lease)
+				return nil, err
+			}
 		}
 		if err := db.becomeLeaderLocked(ctx, lease); err != nil {
 			_ = db.leaser.ReleaseLease(ctx, lease)
@@ -544,6 +563,7 @@ func (db *DB) CloseContext(ctx context.Context) error {
 	// see this when it reaches its own mu section (promote) and abort rather than
 	// bring replication back up on a torn-down instance.
 	db.closed = true
+	wasLeader := db.isLeader // for the clean-shutdown marker, before teardown clears it
 
 	var firstErr error
 	save := func(err error) {
@@ -562,6 +582,20 @@ func (db *DB) CloseContext(ctx context.Context) error {
 		save(db.DB.Close())
 	}
 	save(db.closeReplication(ctx))
+	// Record a clean-shutdown marker so a later restart that re-acquires the lease
+	// directly at Open can prove the local file still matches the replica and resume in
+	// place instead of re-downloading it (see openDirectNeedsRestore). Only when we were
+	// the leader of an s3-leased replica and every durable flush above succeeded — then
+	// the replica reflects all our committed writes. Best-effort: a failed marker forces
+	// a conservative restore on the next open, never a wrong resume, so it must not fail
+	// Close.
+	if db.leaser != nil && wasLeader && firstErr == nil {
+		if txid, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo); err != nil {
+			db.logger.Warn("s3lite: recording clean-shutdown marker failed; next restart will restore", "error", err)
+		} else if err := writeCleanShutdown(db.cleanShutdownPath(), txid); err != nil {
+			db.logger.Warn("s3lite: writing clean-shutdown marker failed; next restart will restore", "error", err)
+		}
+	}
 	// Drop the private follower cache (only followers created it; a no-op otherwise).
 	// Best-effort: a leftover .follow just gets re-established or resumed next run, so a
 	// removal error must not fail Close.

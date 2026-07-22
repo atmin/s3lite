@@ -231,12 +231,15 @@ blank and rely on the instance role.
   `Config.Synchronous: "FULL"` (and `Config.TxLock: "immediate"` to take the
   write lock at BEGIN) — the pragmas apply to every writer connection.
 - A leased writer that crashes and *restarts on the same machine* recovers like an
-  unleased one: it promotes in place and keeps the writes it committed after its last
-  sync, instead of restoring the replica over them. It restores (accepting that
-  sub-second window as lost) only when another instance acquired the lease in between —
-  a genuine takeover its local file may have forked from. So the loss window is at risk
-  only on real machine loss or a true failover, not on a plain process restart. See
-  INVARIANTS.md #9.
+  unleased one: it resumes its local file in place and keeps the writes it committed
+  after its last sync, instead of restoring the replica over them. It restores (accepting
+  that sub-second window as lost) only when another instance acquired the lease in
+  between — a genuine takeover its local file may have forked from. So the loss window is
+  at risk only on real machine loss or a true failover, not on a plain process restart.
+  This holds however the writer re-enters: whether its lease was **still held** at reopen
+  (it comes back as a follower and promotes) or had **already expired** (it re-acquires
+  the lease directly at `Open`). A plain clean restart likewise resumes in place with no
+  full re-download. See INVARIANTS.md #9.
 
 ## Guarantees
 

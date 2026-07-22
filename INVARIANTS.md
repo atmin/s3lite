@@ -131,23 +131,48 @@ and for diagnostics only.
 
 *Enforced by:* `TestGenerationResetsOnCleanHandoff`.
 
-## 9. A leased writer's crash-restart never silently rewinds its committed tail
+## 9. A returning leased writer never silently rewinds — or forks — its committed tail
 
-A leased writer that crashes and restarts on the same machine recovers what an
-unleased writer would: promotion keeps the local file's committed tail rather than
-restoring the replica over it, so writes acked after the last sync are not discarded by
-the instance's own successor. The guard is the lease **generation**. Only the lease
-holder writes, so a fork requires an acquire — which bumps the generation — and a
-promotion resumes the local file *in place* only when the just-acquired generation is
-exactly one past the generation the local tail was written under (recorded in
-`<LocalPath>.leasegen` while leader). Any gap (a successor acquired in between) or a
-missing/unreadable record restores instead, discarding a possibly-forked local history
-in favour of the replica lineage. This leans on the generation only where #8 says it is
-reliable: the promote path is reached only when the prior lock *survived* — was held,
-then expired — never after a clean release.
+A leased writer that crashes and restarts on the same machine recovers what an unleased
+writer would: it keeps the local file's committed tail rather than restoring the replica
+over it, so writes acked after the last sync are not discarded by the instance's own
+successor. It also never does the opposite harm — resuming a local file that a successor
+has *forked* from, which would ship a divergent lineage over the replica (corruption, not
+mere loss). The rule holds whichever way the writer re-enters:
+
+- **Via the loop's `promote()`** — the lease was still *held* at reopen, so the instance
+  came back a follower and promotes. The guard is the lease **generation**: only the
+  holder writes, so a fork requires an acquire (which bumps the generation), and the
+  local file resumes *in place* only when the just-acquired generation is exactly one
+  past the generation the local tail was written under (recorded in `<LocalPath>.leasegen`
+  while leader). Any gap (a successor acquired in between) or a missing/unreadable record
+  restores. This leans on the generation only where #8 says it is reliable: promote is
+  reached only when the prior lock *survived* — held, then expired — never after a clean
+  release.
+
+- **Via `Open`'s direct acquire** — the lease had *already expired* by reopen, so the
+  instance re-acquires it straight away in `Open`, bypassing the loop. Here the generation
+  is ambiguous, because a clean release resets it to 1 (#8), so a clean self-restart and a
+  successor's clean handoff look identical by generation alone. Two signals prove a resume
+  safe, both erring toward restore: **self-succession** (generation exactly one past the
+  recorded one — the lock survived our tenure; recovers an unshipped tail, immune to the
+  local file's L0-lags-WAL skew), and **clean restart** (a clean `Close` writes
+  `<LocalPath>.cleanshutdown` with the replica position it synced to; if that marker is
+  present and the replica has not advanced past it, no other writer wrote since, so the
+  local file still equals the replica — resume for free, no re-download). A generation
+  gap, an advanced replica, a missing/garbage marker, or an unreadable replica restores. A
+  local file that was never a leased leader here (no recorded generation) is a fresh or
+  externally-seeded start, not a returning writer, so it resumes in place unchanged —
+  divergence for a brought-in file is out of scope (the lease is the multi-writer boundary).
+
+So the sub-second loss window is at risk only on real machine loss or a true failover,
+never on a plain process restart or clean restart; and a genuine takeover is always
+restored, never resumed onto a fork.
 
 *Enforced by:* `TestPromoteSelfSuccessionKeepsLocalTail`, `TestPromoteTakeoverRestores`,
-`TestPromoteMissingGenerationRestores`, `TestPromoteNeedsRestoreDecision`.
+`TestPromoteMissingGenerationRestores`, `TestPromoteNeedsRestoreDecision`,
+`TestOpenDirectCleanRestartResumes`, `TestOpenDirectCrashSelfSuccessionResumesTail`,
+`TestOpenDirectTakeoverRestores`, `TestOpenDirectAmbiguousSignalRestores`.
 
 ---
 

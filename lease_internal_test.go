@@ -3179,3 +3179,287 @@ func TestPromoteMissingGenerationRestores(t *testing.T) {
 		t.Fatalf("missing generation must restore exactly once; restoreDBFunc was called %d times", n)
 	}
 }
+
+// --- Item 1/2: open-direct fork guard (returning writer acquires at Open) ----------
+//
+// These pin the sibling of the promote guard: a leased writer whose lease had already
+// expired by reopen re-enters via Open's direct AcquireLease (not the loop's promote),
+// and must apply the same no-fork-resume rule. See INVARIANTS.md #9.
+
+func TestOpenDirectCleanRestartResumes(t *testing.T) {
+	// The dominant, hot path: a writer that cleanly closed and restarts on the same
+	// machine must resume its local file in place — NOT re-download the whole database.
+	// A clean Close leaves a marker at the synced replica position; the reopen sees the
+	// replica unchanged and resumes. Pins the no-regression requirement.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Close(); err != nil { // clean close: syncs, releases the lease, writes the marker
+		t.Fatal(err)
+	}
+
+	// Count only restores from here on: the reopen must not restore.
+	restoreN := installRestoreCounter(t)
+
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if !w2.IsLeader() {
+		t.Fatal("w2 should acquire the free lease directly at Open and become leader")
+	}
+	if n := restoreN.Load(); n != 0 {
+		t.Fatalf("clean restart must resume in place; restoreDBFunc was called %d times", n)
+	}
+	var count int
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("clean restart lost committed rows: got %d, want 3", count)
+	}
+}
+
+func TestOpenDirectCrashSelfSuccessionResumesTail(t *testing.T) {
+	// A leased writer that crashes with an unshipped tail and restarts on the same
+	// machine AFTER its lease has expired re-enters via Open-direct (not the loop's
+	// promote). The generation proves self-succession, so it resumes and keeps the tail
+	// — the crash-restart durability guarantee must hold whether the lease was still held
+	// (promote path) or already expired (this path) at reopen.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 4; i <= 5; i++ { // unshipped committed tail
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	simulateCrash(t, w1) // lease lingers at generation 1, no clean-shutdown marker
+
+	restoreN := installRestoreCounter(t)
+	lock.expire() // the lease has lapsed → the reopen acquires directly at Open (Open-direct)
+
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if !w2.IsLeader() {
+		t.Fatal("w2 should acquire the expired lease directly at Open and become leader")
+	}
+	if n := restoreN.Load(); n != 0 {
+		t.Fatalf("self-succession must resume in place; restoreDBFunc was called %d times", n)
+	}
+	var count int
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 5 {
+		t.Fatalf("Open-direct self-succession lost the local tail: got %d rows, want 5", count)
+	}
+	// And the recovered tail replicates onward: a forced sync ships it, and a fresh full
+	// restore of the replica now sees all five rows.
+	if err := w2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	verifyPath := filepath.Join(t.TempDir(), "verify.sqlite3")
+	if err := restoreDB(ctx, S3Config{}, replicaDir, verifyPath); err != nil { // raw restore, uncounted
+		t.Fatalf("verify restore: %v", err)
+	}
+	vdb, err := sql.Open("sqlite", verifyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vdb.Close()
+	var replicated int
+	if err := vdb.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&replicated); err != nil {
+		t.Fatal(err)
+	}
+	if replicated != 5 {
+		t.Fatalf("recovered tail did not replicate: replica restore has %d rows, want 5", replicated)
+	}
+}
+
+func TestOpenDirectTakeoverRestores(t *testing.T) {
+	// The corruption hazard this task closes: after our crash a successor took over,
+	// forked the replica lineage, and finished. The returning writer re-entering via
+	// Open-direct must restore the replica over its forked local file rather than ship
+	// the fork on top of the successor's lineage.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+	successorPath := filepath.Join(t.TempDir(), "successor.sqlite3")
+
+	// Our tenure (generation 1): ship [v1..v3], then commit a divergent tail [v4,v5].
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 4; i <= 5; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	simulateCrash(t, w1) // local has 5 rows; replica has 3
+
+	// A successor on another machine takes over the expired lease, extends the *replica*
+	// lineage with its own row, and finishes cleanly (releasing the lease).
+	lock.expire()
+	succ, err := Open(ctx, Config{
+		LocalPath: successorPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "other", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := succ.ExecContext(ctx, `INSERT INTO items (name) VALUES ('successor-4')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := succ.Close(); err != nil { // ships the successor row, releases the lease
+		t.Fatal(err)
+	}
+
+	restoreN := installRestoreCounter(t)
+
+	// We return on the original machine: the lease is free (successor released), so we
+	// acquire directly at Open. Our forked local file must be discarded for the replica.
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto,
+		Owner: "node", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if !w2.IsLeader() {
+		t.Fatal("w2 should acquire the free lease directly at Open")
+	}
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("takeover must restore exactly once; restoreDBFunc was called %d times", n)
+	}
+	var count int
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 { // v1,v2,v3 + successor-4 — the replica lineage, not our forked 5
+		t.Fatalf("takeover restore has %d rows, want 4 (the successor lineage)", count)
+	}
+	var forked int
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items WHERE name = 'v5'`).Scan(&forked); err != nil {
+		t.Fatal(err)
+	}
+	if forked != 0 {
+		t.Fatal("takeover resumed the forked local tail instead of restoring the replica")
+	}
+}
+
+func TestOpenDirectAmbiguousSignalRestores(t *testing.T) {
+	// When the clean-restart signal cannot be confirmed — here the replica-position probe
+	// fails, so we cannot prove the replica is unchanged since our clean close — the guard
+	// must fall back to a restore (corruption-safe) and log it, rather than resume blindly.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.Close(); err != nil { // clean close writes the marker (probe still healthy)
+		t.Fatal(err)
+	}
+
+	// Now blind the replica-position probe so the marker cannot be confirmed on reopen.
+	prevProbe := replicaLatestTXIDFunc
+	replicaLatestTXIDFunc = func(context.Context, S3Config, string) (ltx.TXID, error) {
+		return 0, errors.New("probe boom")
+	}
+	t.Cleanup(func() { replicaLatestTXIDFunc = prevProbe })
+
+	restoreN := installRestoreCounter(t)
+	logBuf := &syncBuffer{}
+
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter,
+		Owner: "node", LeaseTTL: time.Minute,
+		Logger: slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("unconfirmable clean restart must restore; restoreDBFunc was called %d times", n)
+	}
+	if !strings.Contains(logBuf.String(), "clean-shutdown replica probe failed") {
+		t.Fatalf("restore fallback should be logged; log was:\n%s", logBuf.String())
+	}
+	var count int // the restore still recovers the committed row from the replica
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("restore fallback lost data: got %d rows, want 1", count)
+	}
+}

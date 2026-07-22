@@ -18,6 +18,7 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/benbjohnson/litestream"
 	lss3 "github.com/benbjohnson/litestream/s3"
+	"github.com/superfly/ltx"
 )
 
 // newLeaserFunc builds the leaser for a leased role. It is a package var so
@@ -114,6 +115,13 @@ func (db *DB) becomeLeaderLocked(ctx context.Context, lease *litestream.Lease) e
 	// promote simply falls back to a conservative restore.
 	if err := writeLeaseGen(db.leaseGenPath(), lease.Generation); err != nil {
 		db.logger.Warn("s3lite: recording lease generation failed; a later self-succession will restore instead of resuming", "error", err)
+	}
+	// Becoming leader invalidates any clean-shutdown marker: from now until our next
+	// clean Close the local file is being written, so a stale marker must never later be
+	// mistaken for "cleanly closed and unchanged." A failed removal is still safe — a
+	// later restart's replica will have advanced past the stale marker, forcing a restore.
+	if err := os.Remove(db.cleanShutdownPath()); err != nil && !os.IsNotExist(err) {
+		db.logger.Warn("s3lite: clearing clean-shutdown marker failed", "error", err)
 	}
 	if err := db.openWriterLocked(ctx); err != nil {
 		db.stopReplicationLocked(canceledContext())
@@ -678,6 +686,128 @@ func (db *DB) promoteNeedsRestore(lease *litestream.Lease) bool {
 	default:
 		return true
 	}
+}
+
+// openDirectNeedsRestore decides whether a leased writer that acquired the lease
+// directly at Open (its prior lease had already expired by reopen) must restore the
+// replica over its existing local file, or may resume that file in place. It closes the
+// sibling gap to promoteNeedsRestore (INVARIANTS.md #9) for the Open path — where the
+// lease generation alone is ambiguous, because a clean release resets it to 1 (#8) and
+// so cannot tell a clean self-restart from a successor's clean handoff.
+//
+// Two independent signals prove a resume is safe; both err toward restore when unproven,
+// since erring toward restore risks only a wasteful re-download while erring toward
+// resume risks shipping a forked lineage (corruption):
+//
+//   - Self-succession (crashed, no takeover): the lock survived from our tenure and we
+//     re-acquired it, bumping exactly one generation past the one our local tail was
+//     written under. Identical to promoteNeedsRestore. Generation-only, so it recovers
+//     an unshipped WAL tail without any replica read and is immune to the local file's
+//     "L0 lags the WAL" skew — a successor cannot share our generation, so a match
+//     proves no one wrote since.
+//   - Clean restart (cleanly closed, no successor since): a clean Close leaves a marker
+//     recording the replica position it finished syncing to. If the marker is present
+//     and the replica has not advanced past it, no other writer wrote since our clean
+//     close, so the local file still equals the replica — resume for free. This is the
+//     common, hot path; without it every clean restart would re-download the database.
+//
+// Once a returning writer is established (a lease generation was recorded here),
+// anything else — a generation gap (a successor took over), a missing/garbage marker,
+// an advanced replica, or an unreadable replica — restores, discarding a possibly-forked
+// local history in favour of the replica lineage.
+//
+// A local file with no recorded lease generation was never a leased leader on this
+// machine, so it is not a returning writer that could have forked from a successor's
+// takeover — it is a fresh or externally-seeded start. That resumes in place, today's
+// behaviour: it keeps fresh deploys unchanged (Item 1) and, crucially, lets a first
+// writer Open against a momentarily-unreachable replica instead of hanging on a restore.
+// Divergence for a brought-in, non-provenance file stays out of scope (the lease, not
+// this guard, is the multi-writer boundary).
+func (db *DB) openDirectNeedsRestore(ctx context.Context, lease *litestream.Lease) bool {
+	persisted := readLeaseGen(db.leaseGenPath())
+	if persisted == 0 {
+		return false
+	}
+	if lease.Generation == persisted+1 {
+		db.logger.Info("s3lite: open resuming in place (self-succession); keeping local committed tail",
+			"generation", lease.Generation, "local_generation", persisted)
+		return false
+	}
+	if marked, ok := readCleanShutdown(db.cleanShutdownPath()); ok {
+		latest, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+		switch {
+		case err != nil:
+			db.logger.Warn("s3lite: open will restore; clean-shutdown replica probe failed", "error", err)
+		case latest == marked:
+			db.logger.Info("s3lite: open resuming in place (clean restart); replica unchanged since clean close",
+				"txid", uint64(marked))
+			return false
+		default:
+			db.logger.Warn("s3lite: open will restore; replica advanced past our clean shutdown (takeover)",
+				"clean_txid", uint64(marked), "replica_txid", uint64(latest))
+		}
+	} else {
+		db.logger.Warn("s3lite: open will restore; no proof the local file matches the replica lineage",
+			"generation", lease.Generation, "local_generation", persisted)
+	}
+	return true
+}
+
+// restoreLocalFromReplica replaces the local database with the replica's latest
+// committed state for the Open-direct fork guard. Unlike rebuildLocalFromReplica it runs
+// before the connector exists (during Open, prior to becomeLeaderLocked), so it restores
+// straight into LocalPath as a plain pre-connector file op rather than a swapFiles
+// rebuild. restoreDBFunc refuses an existing output path, so the stale local files are
+// cleared first; an empty replica (a fresh bucket) leaves a clean WAL database.
+func (db *DB) restoreLocalFromReplica(ctx context.Context) error {
+	path := db.cfg.LocalPath
+	if err := removeLocalDBFiles(path); err != nil {
+		return fmt.Errorf("s3lite: open restore: clear local files: %w", err)
+	}
+	if err := restoreDBFunc(ctx, db.cfg.S3, db.cfg.BackupTo, path); err != nil {
+		return fmt.Errorf("s3lite: open restore: %w", err)
+	}
+	return precreateWAL(ctx, path)
+}
+
+// cleanShutdownPath is the sidecar a leader writes on a clean Close, recording the
+// replica TXID it finished syncing to. A later Open-direct acquire uses it to prove a
+// clean restart (the replica has not advanced since) and resume in place instead of
+// re-downloading the whole database. See openDirectNeedsRestore and INVARIANTS.md #9.
+func (db *DB) cleanShutdownPath() string { return db.cfg.LocalPath + ".cleanshutdown" }
+
+// writeCleanShutdown durably records the replica TXID a clean Close synced to. A torn or
+// partial write is harmless: readCleanShutdown treats an unparseable value as absent,
+// which forces a conservative restore on the next open rather than a wrong resume.
+func writeCleanShutdown(path string, txid ltx.TXID) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(f, "%d\n", uint64(txid)); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// readCleanShutdown returns the recorded clean-shutdown replica TXID and true, or
+// (0, false) when the marker is absent or unparseable. Either way, false means "no proof
+// of a clean restart" → restore.
+func readCleanShutdown(path string) (ltx.TXID, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return ltx.TXID(v), true
 }
 
 // removeLocalDBFiles deletes the SQLite file and its litestream sidecars so a
