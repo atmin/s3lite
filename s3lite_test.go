@@ -337,6 +337,71 @@ func TestBackupToFileReplica(t *testing.T) {
 	}
 }
 
+func TestReplicationStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// A replicated sole writer (file:// BackupTo): once a synchronous Sync has
+	// caught the replica up, the status reads healthy — replicating, a recent
+	// sync, matched tips, no error.
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath: filepath.Join(t.TempDir(), "test.sqlite3"),
+		BackupTo:  "file://" + t.TempDir(),
+		Migrations: []string{
+			`CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('hello')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	st := db.ReplicationStatus()
+	if !st.Replicating {
+		t.Error("a file:// writer should report Replicating")
+	}
+	if st.LastSyncAt.IsZero() {
+		t.Error("LastSyncAt is zero after a successful Sync")
+	}
+	if st.LastError != "" {
+		t.Errorf("LastError = %q, want empty after a clean sync", st.LastError)
+	}
+	if st.LocalTXID == 0 {
+		t.Error("LocalTXID is zero after a committed write")
+	}
+	if st.RemoteTXID != st.LocalTXID || !st.InSync {
+		t.Errorf("after Sync want caught up: local=%d remote=%d inSync=%v",
+			st.LocalTXID, st.RemoteTXID, st.InSync)
+	}
+}
+
+func TestReplicationStatusUnreplicated(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// An unreplicated sole writer (no BackupTo) runs no replication store, so
+	// there is nothing to report — Replicating is false and every field zero.
+	db, err := s3lite.Open(ctx, s3lite.Config{
+		LocalPath:  filepath.Join(t.TempDir(), "test.sqlite3"),
+		Migrations: []string{`CREATE TABLE items (id INTEGER PRIMARY KEY)`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if st := db.ReplicationStatus(); st != (s3lite.ReplicationStatus{}) {
+		t.Errorf("unreplicated writer reports %+v, want the zero value", st)
+	}
+}
+
 func TestCustomLoggerGatesLitestreamInfo(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

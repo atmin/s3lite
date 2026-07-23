@@ -769,6 +769,63 @@ func (db *DB) Sync(ctx context.Context) error {
 	return lsDB.SyncAndWait(ctx)
 }
 
+// ReplicationStatus is a point-in-time snapshot of the metadata replica's
+// health. It is read from the replication engine's own cached view without any
+// network I/O, so it stays responsive precisely when the bucket is unreachable
+// — which is exactly when a caller asks. LastSyncAt and LastError update on
+// every sync attempt; LocalTXID and RemoteTXID are the last-known local and
+// replica tips, and RemoteTXID is reset to zero after a failed sync, so a
+// stalled replica reads as a large lag rather than a misleading ~0.
+type ReplicationStatus struct {
+	// Replicating is true only for a writer that runs a replication store
+	// (BackupTo set). An unreplicated sole writer and every follower report
+	// false with the remaining fields zero — neither drives replication.
+	Replicating bool
+	// LastSyncAt is when the replica last advanced (any successful upload),
+	// zero if it never has. Its staleness is the primary health signal.
+	LastSyncAt time.Time
+	// LocalTXID is the local committed tip litestream replicates from;
+	// RemoteTXID is the last position confirmed on the replica. RemoteTXID
+	// below LocalTXID is the unreplicated lag.
+	LocalTXID  uint64
+	RemoteTXID uint64
+	// InSync is true when the replica has caught up to the local tip.
+	InSync bool
+	// LastError is the most recent sync/checkpoint error, empty when the last
+	// attempt succeeded. It is the last op's error, not a sticky latch — a
+	// later success clears it, so pair it with LastSyncAt staleness to judge a
+	// sustained failure.
+	LastError string
+}
+
+// ReplicationStatus reports the metadata replica's health without any network
+// I/O (see ReplicationStatus). Safe to call concurrently and at any role: a
+// follower or an unreplicated sole writer reports Replicating=false with the
+// remaining fields zero.
+func (db *DB) ReplicationStatus() ReplicationStatus {
+	// Snapshot lsDB under mu like Sync does: promote (→ a new store) and demote
+	// (→ nil) both write it under mu, so an unlocked read races a role change.
+	db.mu.Lock()
+	lsDB := db.lsDB
+	db.mu.Unlock()
+	if lsDB == nil {
+		return ReplicationStatus{}
+	}
+	st := ReplicationStatus{
+		Replicating: true,
+		LastSyncAt:  lsDB.LastSuccessfulSyncAt(),
+		LastError:   lsDB.SyncDiagnostic().Error,
+	}
+	if pos, err := lsDB.Pos(); err == nil {
+		st.LocalTXID = uint64(pos.TXID)
+	}
+	if lsDB.Replica != nil {
+		st.RemoteTXID = uint64(lsDB.Replica.Pos().TXID)
+	}
+	st.InSync = st.LocalTXID > 0 && st.LocalTXID == st.RemoteTXID
+	return st
+}
+
 func (db *DB) closeReplication(ctx context.Context) error {
 	if db.store != nil {
 		return db.store.Close(ctx)
