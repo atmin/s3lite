@@ -3,7 +3,11 @@
 Intended-to-implement units of work, each self-contained (pickable without prior
 context). Delete a file once it lands.
 
-(No scheduled tasks.)
+- [yield-lease.md](yield-lease.md) — `YieldLease` (voluntary release-on-idle
+  that stays alive as a follower) + `Config.OnDemandPromotion` (promotion only
+  on write, with an eager-recovery exception for unshipped tails) + the
+  clean-marker resume proof on the promote path. The release-on-idle slice of
+  `ideas/cooperative-yield.md`, promoted.
 
 (Landed: **promote-outcome-api** — `LastPromoteOutcome() (PromoteOutcome, bool)`
 additively exposes whether a writer entry (loop promote or `Open` direct acquire)

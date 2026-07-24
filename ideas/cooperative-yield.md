@@ -1,9 +1,12 @@
 # Cooperative yield — bounded-fairness writer handoff
 
-> **Status: parked. Do not implement yet.** Captured from a brainstorm. This is a
-> real design, but it is not scheduled and should not be built until we decide the
-> use case justifies it. It presupposes a *migratory writer* (the lease moving
-> between live instances on demand), which s3lite does not do today.
+> **Status: partially promoted.** The **release-on-idle slice** — a voluntary
+> `YieldLease` plus on-demand promotion, no marker or ticketing — is scheduled as
+> [../tasks/yield-lease.md](../tasks/yield-lease.md): both prerequisites below are
+> now met (incremental follower refresh shipped; a consumer with a migratory-writer
+> workload exists). The rest of this doc — the `want-write` marker, ticketing, and
+> min/max-hold fairness for a peer that wants the pen while the holder is *actively*
+> writing — **remains parked. Do not implement yet.**
 
 ## The idea
 
