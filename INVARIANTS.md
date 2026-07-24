@@ -140,15 +140,20 @@ successor. It also never does the opposite harm — resuming a local file that a
 has *forked* from, which would ship a divergent lineage over the replica (corruption, not
 mere loss). The rule holds whichever way the writer re-enters:
 
-- **Via the loop's `promote()`** — the lease was still *held* at reopen, so the instance
-  came back a follower and promotes. The guard is the lease **generation**: only the
-  holder writes, so a fork requires an acquire (which bumps the generation), and the
-  local file resumes *in place* only when the just-acquired generation is exactly one
-  past the generation the local tail was written under (recorded in `<LocalPath>.leasegen`
-  while leader). Any gap (a successor acquired in between) or a missing/unreadable record
-  restores. This leans on the generation only where #8 says it is reliable: promote is
-  reached only when the prior lock *survived* — held, then expired — never after a clean
-  release.
+- **Via the loop's `promote()`** — the instance came back a follower and promotes (its
+  lease was still *held* at reopen, or it cleanly `YieldLease`d and re-promotes on demand).
+  The primary guard is the lease **generation**: only the holder writes, so a fork requires
+  an acquire (which bumps the generation), and the local file resumes *in place* on
+  **self-succession** — the just-acquired generation is exactly one past the generation the
+  local tail was written under (recorded in `<LocalPath>.leasegen` while leader). The
+  generation check leans on #8 only where it is reliable — it *succeeds* only when the prior
+  lock survived (held, then expired), never after a clean release, which resets it to 1. So
+  promote also accepts the **clean-marker proof** the `Open` path uses (below): when the
+  generation check fails but a `.cleanshutdown` marker is present and the replica has not
+  advanced past it, no writer wrote since our clean close/yield, so the local file still
+  equals the replica — resume in place instead of re-downloading what we just synced. This
+  is what lets a cleanly *yielded* instance re-promote in place with no interim writer. A
+  generation gap with no marker, an advanced replica, or an unreadable replica restores.
 
 - **Via `Open`'s direct acquire** — the lease had *already expired* by reopen, so the
   instance re-acquires it straight away in `Open`, bypassing the loop. Here the generation
@@ -230,7 +235,66 @@ pinned by `TestBuildDSN`. The `LastPromoteOutcome()` accessor rides on the four
 restore-vs-resume tests above (each asserts the reported outcome next to its restore
 count) and is additionally pinned by `TestOpenFreshFirstWriterReportsRestored` (a
 first-ever entry reads restored) and `TestFollowerReportsNoPromoteOutcome` (`ok == false`
-before any promotion).
+before any promotion). The promote-path clean-marker proof (the #9 extension that lets a
+cleanly *yielded* instance re-promote in place) is pinned by `TestYieldedRepromotesInPlace`
+and `TestYieldPeerWroteRepromoteRestores` (see #10).
+
+## 10. `YieldLease` is a clean handoff, never a data hazard
+
+`YieldLease` voluntarily relinquishes the lease while the instance stays alive as a
+follower, so a live-but-idle holder can free the pen for a peer's next write instead of
+pinning it until death, deploy, or `Close`. It is a *relinquishment*, not a loss, and it
+is atomic:
+
+- **Clean handoff, never a data hazard.** The lock object is deleted only after
+  fence → final sync → replication stopped, so at the moment of release the replica tip
+  equals the local tip: a successor acquiring immediately sees every acked write. Single
+  writer is preserved — a yield only ever *removes* a holder, and the If-Match delete
+  cannot remove a successor's lock. The yield fences the handle read-only up front (the
+  same hard fence as demotion, #3) so an in-flight transaction cannot commit into the tail
+  after the final sync has captured it — a racing write is either fenced or shipped, never
+  acked-but-unshipped past the release.
+- **A yield that cannot complete aborts atomically.** A final-sync failure or a breach of
+  the lease-expiry deadline (`ExpiresAt − LeaseTTL/6`, as in #2) aborts: the instance
+  attempts a renew and, on success, un-fences and stays the leader (the loop resumes
+  renewing); on failure it takes the standard demote path. It is never left
+  fenced-but-holding or released-but-unsynced.
+- **Yield is not demote.** A successful yield — and a yield whose release finds the lock
+  already gone (stolen after our fresh renew; the tail is already shipped, so nothing is at
+  risk) — never fires `OnDemote` and never drops a tail. `OnDemote` means "lost the lease
+  while relying on it"; a yield is the opposite, a deliberate hand-back. Only the
+  abort-then-demote path (a genuine loss mid-yield) fires it. Demote's own semantics
+  (push-free fencing, lock left in place) are untouched.
+- **A restarted yielded instance resumes for free.** The yield writes the same
+  `.cleanshutdown` marker a clean `Close` does (at the synced replica position), so a
+  yielded instance that is later *restarted* resumes in place through the unchanged
+  Open-direct clean-restart path (#9) rather than re-downloading the database.
+
+`Config.OnDemandPromotion` makes passivity the steady state so a yield is not self-defeating:
+a follower promotes only via explicit `TryPromote` (the consumer's write path), so a yielded
+holder is not immediately re-grabbed by its own background loop. `Open`'s direct acquire is
+deliberately unchanged (bootstrap — first-writer schema creation — and expired-crash
+re-entry keep working, at the cost of one harmless acquire-then-idle-yield per boot when the
+lock happens to be free). **Passivity never parks an unshipped tail:** an instance that may
+hold one — a follower `Open` that finds `.leasegen` present with no clean marker (a crashed
+ex-leader whose lock had not yet expired), or one that just `demote`d (its cancelled-context
+stop may have dropped a tail) — enters *eager recovery* and keeps background-promoting until
+the next writer entry settles the tail (self-succession ships it, or the restore proof
+discards it). A cleanly yielded instance carries both the marker and `.leasegen`, so it is
+correctly passive: the marker is written only after the tail is fully shipped.
+
+*Enforced by:* `TestYieldReleasesOnlyAfterReplicaCaughtUp`,
+`TestWriteRacingYieldEitherFencedOrShipped`, `TestYieldAbortsOnSyncFailureStaysLeader`,
+`TestYieldBoundedByLeaseExpiry`, `TestYieldStolenMidYieldCompletesAsFollower`,
+`TestYieldNotLeader`, `TestDoubleYield`, `TestYieldThenImmediateAcquireByPeer`,
+`TestYieldedRepromotesInPlace`, `TestYieldPeerWroteRepromoteRestores`,
+`TestOnDemandFollowerNeverBackgroundPromotes`, and the regression guard
+`TestCrashedLeaderStaysEagerUnderOnDemand`. The chaos soak
+(`TestChaosSingleWriterDurability`) additionally injects random yields between write bursts,
+so its single-writer, no-reader-regression, and every-acked-row-survives assertions all hold
+across yields. Over a real lease and MinIO under the `integration` tag:
+`TestYieldHandoffS3` (yield over real conditional writes; a peer acquires immediately and
+round-trips data both directions).
 
 ---
 

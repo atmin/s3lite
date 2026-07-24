@@ -90,6 +90,18 @@ func (fl *fakeLock) steal(owner string, ttl time.Duration) {
 	fl.newLeaseLocked(gen, owner, ttl)
 }
 
+// hold extends the current lease's expiry without changing its generation, owner, or etag,
+// so a crashed holder's lease can be kept deterministically "still held" while a successor
+// opens as a follower — decoupling that from the short TTL a test uses to make the loop tick
+// fast.
+func (fl *fakeLock) hold(d time.Duration) {
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+	if fl.lease != nil {
+		fl.lease.ExpiresAt = time.Now().Add(d)
+	}
+}
+
 // expire forces the current lease to have already lapsed, so the next acquire
 // succeeds (bumping the generation) — used to drive a promotion deterministically
 // without waiting out a real TTL.
@@ -114,6 +126,12 @@ type fakeLeaser struct {
 	renewN       atomic.Int64 // number of RenewLease attempts that reached the leaser
 	renewBlocks  atomic.Bool  // model a renew into a network black hole (see RenewLease)
 	releaseFails atomic.Bool  // model a release lost to the network (see ReleaseLease)
+	// onRelease, if set, runs just before ReleaseLease delegates to the lock — a yield's
+	// last (delete-the-lock) step. It lets a test observe the moment of release or interpose
+	// (e.g. steal the lock so the delete fails ErrLeaseNotHeld). Set once after Open and
+	// before YieldLease, so the channel handoff in YieldLease orders the write ahead of this
+	// read on the loop goroutine.
+	onRelease func()
 }
 
 func (f *fakeLeaser) Type() string { return "fake" }
@@ -139,6 +157,9 @@ func (f *fakeLeaser) RenewLease(ctx context.Context, l *litestream.Lease) (*lite
 	return f.lock.renew(l, f.owner, f.ttl)
 }
 func (f *fakeLeaser) ReleaseLease(ctx context.Context, l *litestream.Lease) error {
+	if f.onRelease != nil {
+		f.onRelease()
+	}
 	if f.releaseFails.Load() {
 		return errors.New("release boom")
 	}
@@ -3046,7 +3067,7 @@ func TestPromoteNeedsRestoreDecision(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if got := db.promoteNeedsRestore(&litestream.Lease{Generation: tc.acquired}); got != tc.wantRestore {
+			if got := db.promoteNeedsRestore(context.Background(), &litestream.Lease{Generation: tc.acquired}); got != tc.wantRestore {
 				t.Fatalf("promoteNeedsRestore = %v, want %v", got, tc.wantRestore)
 			}
 		})
@@ -3056,7 +3077,7 @@ func TestPromoteNeedsRestoreDecision(t *testing.T) {
 	if err := os.WriteFile(genPath, []byte("not-a-number"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if !db.promoteNeedsRestore(&litestream.Lease{Generation: 6}) {
+	if !db.promoteNeedsRestore(context.Background(), &litestream.Lease{Generation: 6}) {
 		t.Fatal("garbage sidecar must force a restore")
 	}
 }
@@ -3836,5 +3857,663 @@ func TestOpenDirectAmbiguousSignalRestores(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("restore fallback lost data: got %d rows, want 1", count)
+	}
+}
+
+// --- Yield lease: voluntary release-on-idle + on-demand promotion (INVARIANTS.md #10) --
+
+// restoreAndCount does a fresh full restore of the replica into dest and returns the row
+// count of items. It takes no *testing.T so it is safe to call from a leaser hook running
+// on the lease-loop goroutine (t.Fatalf from a non-test goroutine is unsafe).
+func restoreAndCount(ctx context.Context, replicaURL, dest string) (int, error) {
+	if err := restoreDB(ctx, S3Config{}, replicaURL, dest); err != nil {
+		return 0, err
+	}
+	vdb, err := sql.Open("sqlite", dest)
+	if err != nil {
+		return 0, err
+	}
+	defer vdb.Close()
+	var c int
+	err = vdb.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&c)
+	return c, err
+}
+
+// restoreNames does a fresh full restore of the replica and returns the item names in id
+// order, so a test can assert exactly which rows reached the replica.
+func restoreNames(t *testing.T, ctx context.Context, replicaURL string) []string {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "verify.sqlite3")
+	if err := restoreDB(ctx, S3Config{}, replicaURL, dest); err != nil {
+		t.Fatalf("verify restore: %v", err)
+	}
+	vdb, err := sql.Open("sqlite", dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer vdb.Close()
+	rows, err := vdb.QueryContext(ctx, `SELECT name FROM items ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestYieldReleasesOnlyAfterReplicaCaughtUp(t *testing.T) {
+	// The core safety property: the lock is deleted only after the final sync has caught the
+	// replica up to the local tip, so a successor acquiring immediately sees every acked row.
+	// An injected (slow) final sync records its completion; the release probe asserts the
+	// delete happens strictly after it, and that the replica holds every row at that instant.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	var syncCompleted atomic.Bool
+	prevSync := syncAndWaitFunc
+	syncAndWaitFunc = func(c context.Context, lsDB *litestream.DB) error {
+		if err := prevSync(c, lsDB); err != nil {
+			return err
+		}
+		time.Sleep(30 * time.Millisecond) // widen the window a reorder would fall into
+		syncCompleted.Store(true)
+		return nil
+	}
+	t.Cleanup(func() { syncAndWaitFunc = prevSync })
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: replicaDir,
+		Role: RoleWriter, Owner: "w", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Write rows WITHOUT an explicit Sync, so the yield's final sync is what must ship them.
+	const n = 8
+	for i := 1; i <= n; i++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	probePath := filepath.Join(t.TempDir(), "at-release.sqlite3")
+	var releaseAfterSync atomic.Bool
+	var releaseRows atomic.Int64
+	var probeErr atomic.Value
+	db.leaser.(*fakeLeaser).onRelease = func() {
+		releaseAfterSync.Store(syncCompleted.Load())
+		if c, err := restoreAndCount(ctx, replicaDir, probePath); err != nil {
+			probeErr.Store(err)
+		} else {
+			releaseRows.Store(int64(c))
+		}
+	}
+
+	if err := db.YieldLease(ctx); err != nil {
+		t.Fatalf("yield: %v", err)
+	}
+	if err, _ := probeErr.Load().(error); err != nil {
+		t.Fatalf("release-time replica probe: %v", err)
+	}
+	if !releaseAfterSync.Load() {
+		t.Fatal("the lock was deleted before the final sync completed")
+	}
+	if got := releaseRows.Load(); got != n {
+		t.Fatalf("replica held %d rows at the moment of release, want %d (release must wait for full sync)", got, n)
+	}
+	if db.IsLeader() {
+		t.Fatal("a yielded instance must be a follower")
+	}
+}
+
+func TestWriteRacingYieldEitherFencedOrShipped(t *testing.T) {
+	// A transaction in flight when the yield starts must not produce an acked-but-unshipped
+	// row: the yield fences read-only before its final sync, so a write in that transaction
+	// after the fence is rejected (and never reaches the replica), while a row committed
+	// before the yield is part of the synced tail. (The racing tx is begun — held open — but
+	// does its write only as the yield fences; a tx that already held the SQLite write lock
+	// would block litestream's own sync, a different hazard, so the write is what races.)
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: replicaDir,
+		Role: RoleWriter, Owner: "w", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A row committed before the yield must ship (the "shipped" branch).
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('kept')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// A transaction begun (in flight) before the yield, holding a connection dialed at the
+	// pre-yield generation but no SQLite lock yet.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := db.YieldLease(ctx); err != nil {
+		t.Fatalf("yield: %v", err)
+	}
+
+	// The fence bumped the connection generation, so the write in this pre-yield tx is
+	// rejected onto the lease we just handed back — the exec or the commit fails, and the row
+	// never lands (the "fenced" branch).
+	_, execErr := tx.ExecContext(ctx, `INSERT INTO items (name) VALUES ('racer')`)
+	commitErr := tx.Commit()
+	if execErr == nil && commitErr == nil {
+		t.Fatal("a write in a transaction that spans the yield fence must be rejected")
+	}
+
+	// No acked-but-unshipped row exists: the replica has 'kept' and never 'racer'.
+	got := restoreNames(t, ctx, replicaDir)
+	if strings.Join(got, ",") != "kept" {
+		t.Fatalf("replica after yield = %v, want [kept] (racer must be fenced, never shipped)", got)
+	}
+}
+
+func TestYieldAbortsOnSyncFailureStaysLeader(t *testing.T) {
+	// A final-sync failure (a replica outage mid-yield) aborts atomically: the instance
+	// renews to salvage the lease, un-fences, and stays the leader — never a
+	// released-but-unsynced half-state, and no OnDemote (it never lost the lease).
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 500 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: replicaDir,
+		Role: RoleWriter, Owner: "w", LeaseTTL: ttl,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	var demoted atomic.Bool
+	db.OnDemote(func(error) { demoted.Store(true) })
+
+	boom := errors.New("replica outage")
+	prevSync := syncAndWaitFunc
+	syncAndWaitFunc = func(context.Context, *litestream.DB) error { return boom }
+	t.Cleanup(func() { syncAndWaitFunc = prevSync })
+
+	err = db.YieldLease(ctx)
+	syncAndWaitFunc = prevSync // restore before later writes/renews
+	if err == nil || !errors.Is(err, boom) {
+		t.Fatalf("yield must fail with the sync error; got %v", err)
+	}
+	if !db.IsLeader() {
+		t.Fatal("an aborted yield that salvages the lease must remain leader")
+	}
+	if demoted.Load() {
+		t.Fatal("an abort that keeps the lease must NOT fire OnDemote")
+	}
+	// Un-fenced: writes work again.
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v2')`); err != nil {
+		t.Fatalf("leader must accept writes after an aborted yield: %v", err)
+	}
+	// Renewals continue on the loop: still leader after several ticks.
+	time.Sleep(4 * (ttl / 3))
+	if !db.IsLeader() {
+		t.Fatal("leader must keep renewing after an aborted yield")
+	}
+}
+
+func TestYieldBoundedByLeaseExpiry(t *testing.T) {
+	// A black-holed final sync (a replica that never responds) must not hang the yield past
+	// the lease: the sync is bounded by ExpiresAt - TTL/6 like tryRenew. The yield returns
+	// before the TTL, and — having eaten the whole safe-renew window — takes the standard
+	// demote path (fenced, not leader), never left fenced-but-holding past expiry.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 600 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: replicaDir,
+		Role: RoleWriter, Owner: "w", LeaseTTL: ttl,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	var demoted atomic.Bool
+	db.OnDemote(func(error) { demoted.Store(true) })
+
+	prevSync := syncAndWaitFunc
+	syncAndWaitFunc = func(c context.Context, _ *litestream.DB) error { <-c.Done(); return c.Err() }
+	t.Cleanup(func() { syncAndWaitFunc = prevSync })
+
+	start := time.Now()
+	err = db.YieldLease(ctx)
+	elapsed := time.Since(start)
+	syncAndWaitFunc = prevSync
+
+	if err == nil {
+		t.Fatal("a black-holed final sync must abort the yield")
+	}
+	if elapsed >= ttl {
+		t.Fatalf("yield blocked %v, past the lease TTL %v — the final sync was not bounded by expiry", elapsed, ttl)
+	}
+	// The window was fully consumed, so the salvage renew had no time: standard demote.
+	if db.IsLeader() {
+		t.Fatal("a yield that consumed the whole safe-renew window must not remain a leader")
+	}
+	if !demoted.Load() {
+		t.Fatal("the abort-to-demote path must fire OnDemote (a genuine loss)")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v2')`); err == nil {
+		t.Fatal("a demoted instance must be fenced read-only")
+	}
+}
+
+func TestYieldStolenMidYieldCompletesAsFollower(t *testing.T) {
+	// If the lock is stolen after our fresh renew but before the final delete, ReleaseLease
+	// returns ErrLeaseNotHeld. The tail is already shipped, so the yield still completes
+	// cleanly as a follower and does NOT fire OnDemote (a relinquishment, not a loss).
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: replicaDir,
+		Role: RoleWriter, Owner: "w", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('v1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	var demoted atomic.Bool
+	db.OnDemote(func(error) { demoted.Store(true) })
+
+	// Steal the lock at the moment of release: the If-Match delete then fails.
+	db.leaser.(*fakeLeaser).onRelease = func() { lock.steal("thief", time.Minute) }
+
+	if err := db.YieldLease(ctx); err != nil {
+		t.Fatalf("a steal after the tail is shipped must still complete the yield cleanly: %v", err)
+	}
+	if db.IsLeader() {
+		t.Fatal("a yielded instance must be a follower")
+	}
+	if demoted.Load() {
+		t.Fatal("a clean yield (even stolen at the release) must NOT fire OnDemote")
+	}
+}
+
+func TestYieldNotLeader(t *testing.T) {
+	// A follower has no lease to hand off.
+	lock := &fakeLock{}
+	lock.steal("other", time.Minute)
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "f.sqlite3"), BackupTo: "file://" + t.TempDir(),
+		Role: RoleFollower, Owner: "f", LeaseTTL: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.YieldLease(ctx); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("YieldLease on a follower must return ErrNotLeader, got %v", err)
+	}
+}
+
+func TestDoubleYield(t *testing.T) {
+	// The first yield hands off; a second is a no-op error (not a leader any more).
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: "file://" + t.TempDir(),
+		Role: RoleWriter, Owner: "w", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.YieldLease(ctx); err != nil {
+		t.Fatalf("first yield: %v", err)
+	}
+	if err := db.YieldLease(ctx); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("a second yield must return ErrNotLeader, got %v", err)
+	}
+}
+
+func TestYieldThenImmediateAcquireByPeer(t *testing.T) {
+	// The point of yield: a peer acquires immediately, without waiting out the TTL. A long
+	// TTL means the only way db2 can get the lease is that the yield freed it — and its
+	// restore must contain every row db1 committed before the yield.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "db1.sqlite3"), BackupTo: replicaDir,
+		Role: RoleAuto, Owner: "db1", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	if !db1.IsLeader() {
+		t.Fatal("db1 should acquire the free lease at Open")
+	}
+	for _, n := range []string{"a", "b", "c"} {
+		if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "db2.sqlite3"), BackupTo: replicaDir,
+		Role: RoleAuto, Owner: "db2", LeaseTTL: time.Minute, OnDemandPromotion: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if db2.IsLeader() {
+		t.Fatal("db2 should be a follower while db1 holds the lease")
+	}
+
+	if err := db1.YieldLease(ctx); err != nil {
+		t.Fatalf("yield: %v", err)
+	}
+
+	ok, err := db2.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("peer promote: %v", err)
+	}
+	if !ok || !db2.IsLeader() {
+		t.Fatal("peer should acquire immediately after the yield (no TTL wait)")
+	}
+	var count int
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("peer's restore after yield has %d rows, want 3", count)
+	}
+}
+
+func TestYieldedRepromotesInPlace(t *testing.T) {
+	// A cleanly yielded instance that re-promotes with no interim writer resumes in place —
+	// it does not re-download the state it just finished syncing. The clean-marker proof (the
+	// generation reset by the release makes the self-succession check fail) carries this;
+	// LastPromoteOutcome reports resumed-in-place. See INVARIANTS.md #9 (promote extension).
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "w.sqlite3"), BackupTo: replicaDir,
+		Role: RoleWriter, Owner: "w", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, n := range []string{"v1", "v2", "v3"} {
+		if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.YieldLease(ctx); err != nil {
+		t.Fatalf("yield: %v", err)
+	}
+
+	restoreN := installRestoreCounter(t)
+	ok, err := db.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("re-promote: %v", err)
+	}
+	if !ok || !db.IsLeader() {
+		t.Fatal("the yielder should re-promote into the free lease")
+	}
+	if n := restoreN.Load(); n != 0 {
+		t.Fatalf("re-promote with no interim writer must resume in place; restoreDBFunc was called %d times", n)
+	}
+	if out, ok := db.LastPromoteOutcome(); !ok || out.Restored {
+		t.Fatalf("re-promote-in-place must report resumed; got %+v ok=%v", out, ok)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("re-promote lost committed rows: got %d, want 3", count)
+	}
+}
+
+func TestYieldPeerWroteRepromoteRestores(t *testing.T) {
+	// The mirror of the in-place case: if an interim writer advanced the replica after our
+	// yield, our clean marker no longer matches the replica tip, so re-promotion restores and
+	// picks up the peer's rows rather than resuming a now-stale local file.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "db1.sqlite3"), BackupTo: replicaDir,
+		Role: RoleAuto, Owner: "db1", LeaseTTL: time.Minute,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	for _, n := range []string{"v1", "v2", "v3"} {
+		if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db1.YieldLease(ctx); err != nil {
+		t.Fatalf("yield: %v", err)
+	}
+
+	// A peer acquires the freed lock at Open, writes, and cleanly closes (advancing the
+	// replica and deleting the lock).
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "db2.sqlite3"), BackupTo: replicaDir,
+		Role: RoleAuto, Owner: "db2", LeaseTTL: time.Minute, OnDemandPromotion: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !db2.IsLeader() {
+		t.Fatal("db2 should acquire the freed lock at Open")
+	}
+	if _, err := db2.ExecContext(ctx, `INSERT INTO items (name) VALUES ('peer')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreN := installRestoreCounter(t)
+	ok, err := db1.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("re-promote: %v", err)
+	}
+	if !ok || !db1.IsLeader() {
+		t.Fatal("db1 should re-promote into the freed lock")
+	}
+	if n := restoreN.Load(); n != 1 {
+		t.Fatalf("an interim writer must force a restore; restoreDBFunc was called %d times", n)
+	}
+	if out, ok := db1.LastPromoteOutcome(); !ok || !out.Restored {
+		t.Fatalf("re-promote after a peer wrote must report restored; got %+v ok=%v", out, ok)
+	}
+	var count int
+	if err := db1.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 {
+		t.Fatalf("re-promote restore must include the peer's row: got %d rows, want 4", count)
+	}
+}
+
+func TestOnDemandFollowerNeverBackgroundPromotes(t *testing.T) {
+	// With OnDemandPromotion set and a FREE lock, a (non-eager) follower must not promote in
+	// the background across many ticks; only an explicit TryPromote does.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	ttl := 100 * time.Millisecond
+
+	db, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "f.sqlite3"), BackupTo: replicaDir,
+		Role: RoleFollower, Owner: "f", LeaseTTL: ttl,
+		OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.IsLeader() {
+		t.Fatal("RoleFollower must open read-only even with a free lock")
+	}
+
+	// Several ticks elapse; a passive follower must stay a follower.
+	time.Sleep(6 * ttl)
+	if db.IsLeader() {
+		t.Fatal("an OnDemandPromotion follower must not background-promote a free lock")
+	}
+
+	// The explicit write path still promotes.
+	ok, err := db.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("TryPromote: %v", err)
+	}
+	if !ok || !db.IsLeader() {
+		t.Fatal("explicit TryPromote must still promote under OnDemandPromotion")
+	}
+}
+
+func TestCrashedLeaderStaysEagerUnderOnDemand(t *testing.T) {
+	// The regression guard for on-demand passivity: a crashed ex-leader with an unshipped
+	// tail (.leasegen present, no clean marker) must NOT go passive — passivity would park
+	// the tail until a peer's takeover discarded it (silent loss). It enters eager recovery
+	// and keeps BACKGROUND-promoting (no explicit TryPromote), resumes via self-succession,
+	// and ships the tail.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+	localPath := filepath.Join(t.TempDir(), "node.sqlite3")
+	// Short TTL so the follower loop ticks quickly (TTL/3), letting the BACKGROUND promote
+	// happen fast; the lease is kept "held" independently via lock.hold below.
+	ttl := 300 * time.Millisecond
+
+	w1, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleWriter, Owner: "node",
+		LeaseTTL: ttl, OnDemandPromotion: true, Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 4; i <= 5; i++ { // unshipped committed tail
+		if _, err := w1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	simulateCrash(t, w1)   // .leasegen present, no marker, lease lingers at generation 1
+	lock.hold(time.Minute) // keep it "still held" so w2 deterministically opens a follower
+
+	w2, err := Open(ctx, Config{
+		LocalPath: localPath, BackupTo: replicaDir, Role: RoleAuto, Owner: "node",
+		LeaseTTL: ttl, OnDemandPromotion: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if w2.IsLeader() {
+		t.Fatal("w2 must open as a follower while the stale lease is held")
+	}
+
+	restoreN := installRestoreCounter(t)
+	lock.expire() // the lease lapses; an EAGER follower's background loop must still re-acquire
+
+	waitFor(t, 5*time.Second, w2.IsLeader, "eager follower to background-promote after expiry")
+
+	if n := restoreN.Load(); n != 0 {
+		t.Fatalf("self-succession recovery must resume in place; restoreDBFunc was called %d times", n)
+	}
+	var count int
+	if err := w2.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 5 {
+		t.Fatalf("eager recovery lost the unshipped tail: got %d rows, want 5", count)
+	}
+	// The recovered tail ships onward.
+	if err := w2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(restoreNames(t, ctx, replicaDir)); got != 5 {
+		t.Fatalf("recovered tail did not replicate: fresh restore has %d rows, want 5", got)
 	}
 }

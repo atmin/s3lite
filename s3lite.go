@@ -123,6 +123,24 @@ type Config struct {
 	// an in-flight read spanning the swap may see a rare, retryable error; ticks that
 	// find nothing new do no swap.
 	FollowerRefreshInterval time.Duration
+
+	// OnDemandPromotion, when true, makes a follower promote only via an explicit
+	// TryPromote (the consumer's write path) rather than greedily in the background. It
+	// exists to pair with YieldLease: a bare yield is self-defeating without it, since the
+	// yielder's own background loop (or an idle peer's) would re-acquire the just-freed
+	// lock within a tick and ping-pong restores. With it set, the lock is held only while a
+	// writer is actively writing; between bursts it is free and whoever writes next acquires
+	// instantly through TryPromote.
+	//
+	// Open's direct acquire is unchanged — bootstrap (first-writer schema creation) and an
+	// expired-crash re-entry still acquire at Open — at the cost of one harmless
+	// acquire-then-idle cycle per boot when the lock is free. The one exception to passivity
+	// is eager recovery: an instance that may hold an unshipped local tail (a follower that
+	// finds it was a crashed ex-leader here, or one that was just demoted) keeps
+	// background-promoting until a writer entry ships or discards that tail, so on-demand
+	// mode never turns a crash into silent data loss. A cleanly yielded/closed instance has
+	// its tail provably shipped, so it stays passive. Ignored without an s3:// BackupTo.
+	OnDemandPromotion bool
 }
 
 // Role selects how an instance coordinates single-writer access to an s3://
@@ -165,6 +183,11 @@ const DefaultLeaseTTL = 30 * time.Second
 // ErrClosed is returned by TryPromote when the instance is closing, so a
 // promotion racing Close cannot resurrect a torn-down instance.
 var ErrClosed = errors.New("s3lite: instance is closed")
+
+// ErrNotLeader is returned by YieldLease when the instance is not the lease holder —
+// a follower, an already-yielded instance (double yield), or an unleased sole writer
+// (which has no lease to yield). Only a live leader can voluntarily hand off.
+var ErrNotLeader = errors.New("s3lite: not the lease holder")
 
 // S3Config holds S3 connection settings. Callers are responsible for sourcing
 // these values (e.g. from environment variables).
@@ -218,6 +241,12 @@ type DB struct {
 	lease    *litestream.Lease
 	isLeader bool
 	closed   bool // set by Close under mu; blocks a late promotion from resurrecting a torn-down instance
+	// eager marks a follower that may hold an unshipped local tail (a crashed ex-leader, or
+	// one just demoted) and so must keep background-promoting even under OnDemandPromotion,
+	// until a writer entry settles the tail. Set at Open (initEagerRecovery) and by demote;
+	// cleared by becomeLeaderLocked. Guarded by mu — read on the loop, written on the loop
+	// and (via becomeLeaderLocked) on a TryPromote caller. See onDemandPassive.
+	eager bool
 
 	// promoteOutcome records how this instance most recently entered the writer role
 	// (restored vs resumed in place); see LastPromoteOutcome. promoteOutcomeValid gates
@@ -250,6 +279,13 @@ type DB struct {
 
 	loopCancel context.CancelFunc
 	wg         sync.WaitGroup
+
+	// yieldC hands a YieldLease call to the leaseLoop goroutine to execute (so a yield is
+	// serialized with renew/promote/refresh by construction); loopDone is closed when that
+	// goroutine exits, so a yield enqueued as the loop tears down does not block forever.
+	// Both are created in startLeaseLoop and are nil for an unleased sole writer.
+	yieldC   chan yieldRequest
+	loopDone chan struct{}
 }
 
 // Open opens or creates a SQLite database at cfg.LocalPath.
@@ -382,6 +418,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 				if oerr := db.openFollowerLocked(ctx); oerr != nil {
 					return nil, oerr
 				}
+				db.initEagerRecovery()
 				db.seedRefreshPos(ctx)
 				db.startLeaseLoop()
 				return db, nil
@@ -417,6 +454,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		if err := db.openFollowerLocked(ctx); err != nil {
 			return nil, err
 		}
+		db.initEagerRecovery()
 		db.seedRefreshPos(ctx)
 		db.startLeaseLoop()
 		return db, nil
@@ -656,6 +694,49 @@ func (db *DB) IsLeader() bool {
 // ErrClosed; callers should stop calling TryPromote when they start shutting down.
 func (db *DB) TryPromote(ctx context.Context) (bool, error) {
 	return db.tryPromoteOnce(ctx)
+}
+
+// YieldLease voluntarily releases the lease while keeping this instance alive as a
+// read-only follower, so a peer's next write can acquire immediately instead of waiting
+// out the TTL or being refused while a live-but-idle holder pins the lock. It is the
+// release-on-idle handoff: the consumer, which knows its own activity, calls it when it
+// goes quiet; s3lite performs a safe hand-back — fence, final durable sync, stop
+// replication, record a clean-shutdown marker, then delete the lock last — so a successor
+// acquiring right after sees every acked write (INVARIANTS.md #10).
+//
+// Pair it with Config.OnDemandPromotion: without that, this instance's own background loop
+// (or an idle peer's) re-acquires the just-freed lock within a tick, making the yield
+// self-defeating. With it, the yielded instance stays passive and whoever writes next
+// promotes via TryPromote.
+//
+// It returns ErrNotLeader if the instance is not the current lease holder (a follower, an
+// already-yielded instance, or an unleased sole writer). If the final sync cannot complete
+// before the lease deadline the yield aborts atomically: the instance stays the leader with
+// renewals running, or — if it can no longer hold the lease — takes the standard demote
+// path (the only case that fires OnDemote). A successful yield never fires OnDemote. Bound
+// ctx to cap how long the final sync may take. Do not call it concurrently with Close.
+func (db *DB) YieldLease(ctx context.Context) error {
+	if db.leaser == nil {
+		return ErrNotLeader // unleased sole writer: no lease to hand off
+	}
+	if !db.IsLeader() { // fast path; doYield re-checks authoritatively on the loop
+		return ErrNotLeader
+	}
+	reply := make(chan error, 1)
+	select {
+	case db.yieldC <- yieldRequest{ctx: ctx, reply: reply}:
+	case <-db.loopDone:
+		return ErrNotLeader // the loop exited (Close) before it could take the request
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// The loop guarantees a reply once it has taken the request; loopDone is a safety net.
+	select {
+	case err := <-reply:
+		return err
+	case <-db.loopDone:
+		return ErrNotLeader
+	}
 }
 
 // Generation returns the lease generation, or 0 when not holding a lease (including

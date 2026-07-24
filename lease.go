@@ -132,6 +132,10 @@ func (db *DB) becomeLeaderLocked(ctx context.Context, lease *litestream.Lease, r
 	}
 	db.lease = lease
 	db.isLeader = true
+	// A writer entry settles any unshipped-tail obligation: the tail either shipped via
+	// self-succession or was discarded by the restore proof. Clearing eager returns an
+	// on-demand follower to passivity after recovery (see followerTick / initEagerRecovery).
+	db.eager = false
 	db.promoteOutcome = PromoteOutcome{Restored: restored, Generation: lease.Generation}
 	db.promoteOutcomeValid = true
 	return nil
@@ -150,9 +154,19 @@ func (db *DB) stopReplicationLocked(ctx context.Context) error {
 	return err
 }
 
+// yieldRequest is a YieldLease call handed to the leaseLoop goroutine to execute, so the
+// yield is serialized with renew, follower-tick, and refresh by construction (they all run
+// on that one goroutine). reply is buffered so the loop never blocks delivering the result.
+type yieldRequest struct {
+	ctx   context.Context
+	reply chan error
+}
+
 // startLeaseLoop launches the background renew/promotion goroutine. Called once
 // at the end of Open for leased roles.
 func (db *DB) startLeaseLoop() {
+	db.yieldC = make(chan yieldRequest)
+	db.loopDone = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	db.loopCancel = cancel
 	db.wg.Add(1)
@@ -168,6 +182,9 @@ func (db *DB) startLeaseLoop() {
 // callers. It exits when ctx is cancelled.
 func (db *DB) leaseLoop(ctx context.Context) {
 	defer db.wg.Done()
+	// Signal YieldLease callers that the loop has exited, so one that enqueues a request as
+	// the loop is tearing down (a racing Close) does not block forever waiting for a reply.
+	defer close(db.loopDone)
 
 	interval := db.leaseTTL / 3
 	if interval <= 0 {
@@ -205,6 +222,10 @@ func (db *DB) leaseLoop(ctx context.Context) {
 			if err := db.refreshFollowerOnce(ctx); err != nil && ctx.Err() == nil {
 				db.logger.Warn("s3lite: follower refresh failed", "error", err)
 			}
+		case req := <-db.yieldC:
+			// Run the yield on this goroutine so it cannot race renew/follower-tick/refresh;
+			// the reply channel is buffered, so this never blocks even if the caller gave up.
+			req.reply <- db.doYield(req.ctx)
 		}
 	}
 }
@@ -261,6 +282,11 @@ func (db *DB) demote(cause error) {
 	}
 	db.isLeader = false
 	db.lease = nil
+	// A demote's cancelled-context stop drops any writes since the last periodic sync, so
+	// the local file may hold an unshipped tail. Under OnDemandPromotion the follower must
+	// therefore stay eager (keep background-promoting) until a writer entry ships or discards
+	// that tail — passivity here would silently park it. Cleared by becomeLeaderLocked.
+	db.eager = true
 	onDemote := db.onDemote
 	// Stop with a cancelled context so store.Close does not attempt a final push:
 	// a lost lease may already belong to another writer, and pushing now risks a
@@ -285,6 +311,150 @@ func (db *DB) demote(cause error) {
 	}
 }
 
+// doYield performs the voluntary release-on-idle handoff. It runs ON the leaseLoop
+// goroutine (dispatched from the yieldC select case), so it is serialized with renew,
+// follower-tick, and refresh by construction; it additionally holds promoteMu to exclude a
+// concurrent TryPromote. On success the instance ends a follower with the tail fully
+// shipped and the lock released, without ever firing OnDemote. See INVARIANTS.md #10.
+func (db *DB) doYield(ctx context.Context) error {
+	db.promoteMu.Lock()
+	defer db.promoteMu.Unlock()
+
+	db.mu.Lock()
+	if !db.isLeader || db.lease == nil {
+		db.mu.Unlock()
+		return ErrNotLeader
+	}
+	lease := db.lease
+	db.mu.Unlock()
+
+	// 1. Renew up front for a fresh full-TTL window to complete the yield in, bounded like
+	// tryRenew so it cannot outlive the lease. A failure here is before any fence — surface
+	// it and stay leader; the loop's next renew demotes if the lease is genuinely gone.
+	renewCtx, cancel := context.WithDeadline(ctx, lease.ExpiresAt.Add(-db.leaseTTL/6))
+	newLease, err := db.leaser.RenewLease(renewCtx, lease)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("s3lite: yield: up-front renew: %w", err)
+	}
+	db.mu.Lock()
+	db.lease = newLease
+	db.mu.Unlock()
+
+	// 2. Fence read-only (the same hard fence demote uses): in-flight transactions cannot
+	// commit past this point, so the final sync captures a quiescent tail (#3).
+	db.connector.setMode(true)
+
+	// 3. Final sync, bounded by the fresh lease's safe-renew deadline. On failure or a
+	// deadline breach the yield aborts atomically (un-fence + stay leader, or demote).
+	syncCtx, cancel := context.WithDeadline(ctx, newLease.ExpiresAt.Add(-db.leaseTTL/6))
+	syncErr := db.syncAndAssertCaughtUp(syncCtx)
+	cancel()
+	if syncErr != nil {
+		return db.abortYield(newLease, syncErr)
+	}
+
+	// 4. Stop replication with a LIVE context — the final push is wanted here (the exact
+	// opposite of demote's cancelled-context stop).
+	db.mu.Lock()
+	_ = db.stopReplicationLocked(ctx)
+	db.mu.Unlock()
+
+	// 5. Record the clean-shutdown marker at the synced replica position, reusing
+	// .cleanshutdown so a restart of this yielded instance resumes for free through the
+	// unchanged openDirectNeedsRestore path. Best-effort like Close: a failed marker only
+	// costs a re-promote/restart a conservative restore, never a wrong resume. The same
+	// probe seeds lastRefreshPos so the first follower-refresh tick is a no-op unless a
+	// successor writes.
+	syncedTXID, probeErr := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	if probeErr != nil {
+		db.logger.Warn("s3lite: yield: reading synced replica position failed; a restart/re-promote will restore", "error", probeErr)
+		syncedTXID = 0
+	} else if err := writeCleanShutdown(db.cleanShutdownPath(), syncedTXID); err != nil {
+		db.logger.Warn("s3lite: yield: writing clean-shutdown marker failed; a restart/re-promote will restore", "error", err)
+	}
+
+	// 6. Release the lock last (If-Match delete), after the sync — a successor only takes
+	// over once our writes are durable. A steal after our fresh renew shows up here as
+	// ErrLeaseNotHeld: the tail is already shipped, so complete cleanly as a follower.
+	releaseErr := db.leaser.ReleaseLease(ctx, newLease)
+
+	// 7. Flip to follower. eager stays false (the tail shipped, nothing to recover), so an
+	// OnDemandPromotion follower is now passive and will promote only on the write path.
+	db.mu.Lock()
+	db.isLeader = false
+	db.lease = nil
+	db.lastRefreshPos = syncedTXID
+	db.mu.Unlock()
+
+	if releaseErr != nil && !errors.Is(releaseErr, litestream.ErrLeaseNotHeld) {
+		// The tail is durable and the fence is up; the lock will simply expire. Report the
+		// release failure but complete the transition, mirroring Close. No OnDemote — this
+		// is a relinquishment, not a lost-while-relying-on-it demotion.
+		db.logger.Warn("s3lite: yield: releasing the lock failed; it will expire before a successor acquires", "error", releaseErr)
+		return fmt.Errorf("s3lite: yield: release: %w", releaseErr)
+	}
+	db.logger.Info("s3lite: yielded lease; now a follower", "synced_txid", uint64(syncedTXID))
+	return nil
+}
+
+// syncAndWaitFunc performs the yield's final durable flush. It is a package var so tests
+// can inject a slow, hanging, or failing sync without a real backend, mirroring
+// restoreDBFunc / replicaLatestTXIDFunc; in production it is always the litestream DB's own
+// SyncAndWait.
+var syncAndWaitFunc = func(ctx context.Context, lsDB *litestream.DB) error {
+	return lsDB.SyncAndWait(ctx)
+}
+
+// syncAndAssertCaughtUp performs the yield's final durable flush and verifies the replica
+// tip has reached the local tip. SyncAndWait already blocks until caught up; the position
+// check is belt-and-braces (the fence in doYield step 2 makes one sync sufficient) so a
+// yield never deletes the lock while the replica trails the acked local state.
+func (db *DB) syncAndAssertCaughtUp(ctx context.Context) error {
+	db.mu.Lock()
+	lsDB := db.lsDB
+	db.mu.Unlock()
+	if lsDB == nil {
+		return errors.New("s3lite: yield: replication store is not running")
+	}
+	if err := syncAndWaitFunc(ctx, lsDB); err != nil {
+		return err
+	}
+	local, err := lsDB.Pos()
+	if err != nil {
+		return fmt.Errorf("s3lite: yield: read local position: %w", err)
+	}
+	var remote ltx.TXID
+	if lsDB.Replica != nil {
+		remote = lsDB.Replica.Pos().TXID
+	}
+	if remote < local.TXID {
+		return fmt.Errorf("s3lite: yield: replica tip %s trails local %s after final sync", remote, local.TXID)
+	}
+	return nil
+}
+
+// abortYield undoes a yield whose final sync failed or breached the lease deadline. It has
+// fenced but not yet released or stopped replication, so the only two clean end states are:
+// still the leader (a salvage renew succeeded — un-fence and let the loop resume renewing),
+// or fully demoted (the renew failed too — a genuine loss, so fire OnDemote via demote). It
+// renews on a fresh background context bounded by the held lease's deadline so a cancelled
+// caller ctx cannot force a needless demotion. Never a half-state.
+func (db *DB) abortYield(heldLease *litestream.Lease, cause error) error {
+	renewCtx, cancel := context.WithDeadline(context.Background(), heldLease.ExpiresAt.Add(-db.leaseTTL/6))
+	newLease, rerr := db.leaser.RenewLease(renewCtx, heldLease)
+	cancel()
+	if rerr != nil {
+		db.demote(cause) // genuine loss: stop (cancelled ctx), fence, fire OnDemote
+		return fmt.Errorf("s3lite: yield aborted and lease lost, demoted: %w", cause)
+	}
+	db.mu.Lock()
+	db.lease = newLease
+	db.mu.Unlock()
+	db.connector.setMode(false) // un-fence: writable leader again
+	return fmt.Errorf("s3lite: yield aborted, still leader: %w", cause)
+}
+
 // followerTick is the background leaseLoop's follower-branch promotion attempt. It
 // routes through tryPromoteOnce (the shared, guarded path) and preserves the loop's
 // "log and move on" behaviour: a lease still held elsewhere is a silent no-op, and
@@ -296,6 +466,9 @@ func (db *DB) demote(cause error) {
 // single tick. A lease merely held elsewhere is a normal no-op and resets the
 // backoff. Loop-confined: only leaseLoop calls this.
 func (db *DB) followerTick(ctx context.Context) {
+	if db.onDemandPassive() {
+		return // promotion is on the write path (TryPromote) only; no unshipped tail to recover
+	}
 	if db.promoteSkip > 0 {
 		db.promoteSkip-- // backing off after a recent failure
 		return
@@ -313,6 +486,41 @@ func (db *DB) followerTick(ctx context.Context) {
 	default:
 		db.promoteBackoff = 0 // lease held elsewhere — normal, clear any backoff
 	}
+}
+
+// onDemandPassive reports whether the background loop must NOT promote this follower.
+// It is true only when Config.OnDemandPromotion is set AND the instance is not in eager
+// recovery — i.e. it holds no unshipped local tail whose fate is unsettled, so promotion
+// can safely wait for an explicit TryPromote on the consumer's write path. An eager
+// follower (a crashed ex-leader, or one just demoted) keeps background-promoting so a
+// crash never silently parks its tail; see initEagerRecovery, demote, becomeLeaderLocked.
+func (db *DB) onDemandPassive() bool {
+	if !db.cfg.OnDemandPromotion {
+		return false
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return !db.eager
+}
+
+// initEagerRecovery seeds the eager-recovery flag for a follower at Open, before the loop
+// starts. A follower whose local file was a leased leader here (a lease generation is
+// recorded) but carries no clean-shutdown marker is a crashed ex-leader that may hold an
+// unshipped tail — it must keep background-promoting under OnDemandPromotion until a writer
+// entry settles that tail. A clean marker (a prior clean Close or yield) proves the tail is
+// fully shipped, so passivity is safe; a file that was never a leader here has nothing to
+// ship. Best-effort reads: an unreadable sidecar errs toward eager (a needless
+// background-promote), the same conservative direction as the fork guards.
+func (db *DB) initEagerRecovery() {
+	if readLeaseGen(db.leaseGenPath()) == 0 {
+		return // never a leader here → no unshipped-tail obligation
+	}
+	if _, ok := readCleanShutdown(db.cleanShutdownPath()); ok {
+		return // clean marker ⇒ tail fully shipped ⇒ passive is correct
+	}
+	db.mu.Lock()
+	db.eager = true
+	db.mu.Unlock()
 }
 
 // promotionSkipTicks returns how many loop ticks to skip before the next background
@@ -460,9 +668,10 @@ func (db *DB) promote(ctx context.Context, lease *litestream.Lease) error {
 
 	// Decide whether to restore or promote in place. Provable self-succession (this
 	// machine's crashed writer coming back with no other instance having acquired the
-	// lease since) keeps its local committed tail; anything else restores. See
-	// promoteNeedsRestore.
-	needRestore := db.promoteNeedsRestore(lease)
+	// lease since) or a clean-marker resume (a cleanly yielded/closed instance whose
+	// replica has not advanced) keeps its local committed tail; anything else restores.
+	// See promoteNeedsRestore.
+	needRestore := db.promoteNeedsRestore(ctx, lease)
 
 	// Gate connection creation across the (possible) rebuild, so no query observes a
 	// half-restored database, then flip the handle writable. The stable *sql.DB is
@@ -681,25 +890,63 @@ func readLeaseGen(path string) int64 {
 
 // promoteNeedsRestore decides whether a promotion must restore the replica over the
 // local file (today's default) or may promote in place and keep the local committed
-// tail. It returns false only for provable self-succession: the lease we just acquired
-// is exactly one generation past the one our local tail was written under, so no other
-// instance acquired the lease (and could have forked the replica) in between. A
-// generation gap means a successor took over — restore. A missing/unreadable sidecar
-// (a fresh follower's first promotion, or a non-leased-origin file) means no proof —
-// restore. See tasks/local-ahead-promote.md and INVARIANTS.md.
-func (db *DB) promoteNeedsRestore(lease *litestream.Lease) bool {
+// tail. Two proofs let it resume, both erring toward restore when unproven:
+//
+//   - Self-succession: the lease we just acquired is exactly one generation past the one
+//     our local tail was written under, so no other instance acquired the lease (and could
+//     have forked the replica) in between. This is the crash-restart path, and it needs no
+//     replica probe. A generation gap means a successor took over — restore.
+//   - Clean-marker resume: the generation check cannot fire after a clean release (it
+//     resets to 1, #8), so a cleanly *yielded* instance re-promoting would always fail it
+//     and needlessly restore the state it just finished syncing. When a `.cleanshutdown`
+//     marker is present and the replica has not advanced past it, no writer wrote since our
+//     clean close/yield, so the local file still equals the replica — resume in place. This
+//     is the same proof openDirectNeedsRestore uses (cleanMarkerResumeOK), one replica probe
+//     taken only when the generation proof fails and a marker exists.
+//
+// A missing/unreadable generation sidecar with no marker (a fresh follower's first
+// promotion, or a non-leased-origin file) means no proof — restore. See INVARIANTS.md #9.
+func (db *DB) promoteNeedsRestore(ctx context.Context, lease *litestream.Lease) bool {
 	persisted := readLeaseGen(db.leaseGenPath())
-	switch {
-	case persisted > 0 && lease.Generation == persisted+1:
+	if persisted > 0 && lease.Generation == persisted+1 {
 		db.logger.Info("s3lite: promoting in place (self-succession); keeping local committed tail",
 			"generation", lease.Generation, "local_generation", persisted)
 		return false
-	case persisted > 0:
+	}
+	if db.cleanMarkerResumeOK(ctx) {
+		return false
+	}
+	if persisted > 0 {
 		db.logger.Warn("s3lite: promote will restore; lease generation advanced past our tenure (takeover)",
 			"generation", lease.Generation, "local_generation", persisted)
+	}
+	return true
+}
+
+// cleanMarkerResumeOK reports whether the clean-shutdown marker proves the local file still
+// equals the replica lineage: the marker is present (written only after a clean Close or
+// YieldLease fully shipped the tail) and the replica has not advanced past it, so no writer
+// wrote since. It is the shared "clean restart / post-yield resume" proof used by both the
+// promote path and the Open-direct path. A probe failure or an advanced replica returns
+// false (restore) — the conservative direction of #9. No marker means no probe.
+func (db *DB) cleanMarkerResumeOK(ctx context.Context) bool {
+	marked, ok := readCleanShutdown(db.cleanShutdownPath())
+	if !ok {
+		return false
+	}
+	latest, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	switch {
+	case err != nil:
+		db.logger.Warn("s3lite: will restore; clean-shutdown replica probe failed", "error", err)
+		return false
+	case latest == marked:
+		db.logger.Info("s3lite: resuming in place; replica unchanged since our clean close/yield",
+			"txid", uint64(marked))
 		return true
 	default:
-		return true
+		db.logger.Warn("s3lite: will restore; replica advanced past our clean shutdown (takeover)",
+			"clean_txid", uint64(marked), "replica_txid", uint64(latest))
+		return false
 	}
 }
 
@@ -748,20 +995,12 @@ func (db *DB) openDirectNeedsRestore(ctx context.Context, lease *litestream.Leas
 			"generation", lease.Generation, "local_generation", persisted)
 		return false
 	}
-	if marked, ok := readCleanShutdown(db.cleanShutdownPath()); ok {
-		latest, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
-		switch {
-		case err != nil:
-			db.logger.Warn("s3lite: open will restore; clean-shutdown replica probe failed", "error", err)
-		case latest == marked:
-			db.logger.Info("s3lite: open resuming in place (clean restart); replica unchanged since clean close",
-				"txid", uint64(marked))
-			return false
-		default:
-			db.logger.Warn("s3lite: open will restore; replica advanced past our clean shutdown (takeover)",
-				"clean_txid", uint64(marked), "replica_txid", uint64(latest))
-		}
-	} else {
+	// Generation proof failed. Fall back to the shared clean-marker proof (a clean restart
+	// or a restarted post-yield instance); cleanMarkerResumeOK logs the probe outcome.
+	if db.cleanMarkerResumeOK(ctx) {
+		return false
+	}
+	if _, ok := readCleanShutdown(db.cleanShutdownPath()); !ok {
 		db.logger.Warn("s3lite: open will restore; no proof the local file matches the replica lineage",
 			"generation", lease.Generation, "local_generation", persisted)
 	}

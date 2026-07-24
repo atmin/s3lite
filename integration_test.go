@@ -156,6 +156,96 @@ func TestLeaseMutualExclusionAndHandoffS3(t *testing.T) {
 	}
 }
 
+func TestYieldHandoffS3(t *testing.T) {
+	// Voluntary release-on-idle over real conditional writes: a leader YieldLease-s, a peer
+	// acquires immediately (no TTL wait) via TryPromote and sees the yielded rows, then the
+	// roles reverse — data round-trips both directions across the lease. Pairs with
+	// OnDemandPromotion so neither instance greedily re-grabs the freed lock. INVARIANTS.md #10.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	env := startMinIO(ctx, t, "yield")
+	bucketURL := "s3://yield/db"
+	root := t.TempDir()
+	// A long TTL proves the peer acquires because the yield FREED the lock, not because it
+	// expired.
+	ttl := 30 * time.Second
+
+	openAuto := func(owner string) *s3lite.DB {
+		t.Helper()
+		db, err := s3lite.Open(ctx, s3lite.Config{
+			LocalPath:         filepath.Join(root, owner+".sqlite3"),
+			BackupTo:          bucketURL,
+			S3:                env.cfg,
+			Role:              s3lite.RoleAuto,
+			Owner:             owner,
+			LeaseTTL:          ttl,
+			OnDemandPromotion: true,
+			Migrations:        []string{`CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, name TEXT)`},
+		})
+		if err != nil {
+			t.Fatalf("open %s: %v", owner, err)
+		}
+		return db
+	}
+
+	db1 := openAuto("db1")
+	defer db1.Close()
+	db2 := openAuto("db2")
+	defer db2.Close()
+	if !db1.IsLeader() || db2.IsLeader() {
+		t.Fatalf("expected exactly one leader (db1); db1=%v db2=%v", db1.IsLeader(), db2.IsLeader())
+	}
+
+	if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES ('from-db1')`); err != nil {
+		t.Fatalf("db1 write: %v", err)
+	}
+
+	// db1 hands the lease back; it stays alive as a follower.
+	if err := db1.YieldLease(ctx); err != nil {
+		t.Fatalf("db1 yield: %v", err)
+	}
+	if db1.IsLeader() {
+		t.Fatal("db1 must be a follower after yielding")
+	}
+
+	// The peer acquires immediately — no TTL wait — and sees the yielded row.
+	ok, err := db2.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("db2 promote: %v", err)
+	}
+	if !ok || !db2.IsLeader() {
+		t.Fatal("db2 should acquire the freed lock immediately after the yield")
+	}
+	var got string
+	if err := db2.QueryRowContext(ctx, `SELECT name FROM items WHERE name='from-db1'`).Scan(&got); err != nil {
+		t.Fatalf("db2 cannot read the yielded row: %v", err)
+	}
+	if _, err := db2.ExecContext(ctx, `INSERT INTO items (name) VALUES ('from-db2')`); err != nil {
+		t.Fatalf("db2 write: %v", err)
+	}
+
+	// Reverse the roles: db2 yields, db1 re-promotes and sees both rows — the data made the
+	// round trip back over the same replica.
+	if err := db2.YieldLease(ctx); err != nil {
+		t.Fatalf("db2 yield: %v", err)
+	}
+	ok, err = db1.TryPromote(ctx)
+	if err != nil {
+		t.Fatalf("db1 re-promote: %v", err)
+	}
+	if !ok || !db1.IsLeader() {
+		t.Fatal("db1 should re-acquire the freed lock immediately after db2's yield")
+	}
+	var count int
+	if err := db1.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&count); err != nil {
+		t.Fatalf("db1 read after round trip: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("after the round trip db1 should see both rows, got %d", count)
+	}
+}
+
 func TestFollowerIncrementalRefreshS3(t *testing.T) {
 	// Over real object storage (MinIO), a follower with FollowerRefreshInterval catches
 	// up to the leader's writes through the incremental follow path — proving

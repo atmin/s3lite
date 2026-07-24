@@ -3,13 +3,19 @@
 Intended-to-implement units of work, each self-contained (pickable without prior
 context). Delete a file once it lands.
 
-- [yield-lease.md](yield-lease.md) — `YieldLease` (voluntary release-on-idle
-  that stays alive as a follower) + `Config.OnDemandPromotion` (promotion only
-  on write, with an eager-recovery exception for unshipped tails) + the
-  clean-marker resume proof on the promote path. The release-on-idle slice of
-  `ideas/cooperative-yield.md`, promoted.
+(No scheduled tasks right now — see [../ideas/](../ideas/) for directions captured but
+not scheduled.)
 
-(Landed: **promote-outcome-api** — `LastPromoteOutcome() (PromoteOutcome, bool)`
+(Landed: **yield-lease** — `YieldLease` (a leader-only voluntary release-on-idle handoff
+that fences → final-syncs → stops replication → writes the clean-shutdown marker →
+releases last, staying alive as a follower; aborts atomically on a sync failure/deadline
+and never fires `OnDemote`) + `Config.OnDemandPromotion` (a follower promotes only via
+explicit `TryPromote`, with an eager-recovery exception that keeps a crashed ex-leader or a
+just-demoted instance background-promoting until its unshipped tail is settled) + the
+clean-marker resume proof hoisted onto the promote path (a cleanly yielded instance
+re-promotes in place with no interim writer). The release-on-idle slice of
+`ideas/cooperative-yield.md`, promoted; INVARIANTS.md #10 + #9 extension.
+**promote-outcome-api** — `LastPromoteOutcome() (PromoteOutcome, bool)`
 additively exposes whether a writer entry (loop promote or `Open` direct acquire)
 restored the replica or resumed the local file in place. It is recorded in
 `becomeLeaderLocked` beside `isLeader` (and in the unleased sole-writer path), covers both

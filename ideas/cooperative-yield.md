@@ -1,12 +1,12 @@
 # Cooperative yield — bounded-fairness writer handoff
 
-> **Status: partially promoted.** The **release-on-idle slice** — a voluntary
-> `YieldLease` plus on-demand promotion, no marker or ticketing — is scheduled as
-> [../tasks/yield-lease.md](../tasks/yield-lease.md): both prerequisites below are
-> now met (incremental follower refresh shipped; a consumer with a migratory-writer
-> workload exists). The rest of this doc — the `want-write` marker, ticketing, and
-> min/max-hold fairness for a peer that wants the pen while the holder is *actively*
-> writing — **remains parked. Do not implement yet.**
+> **Status: partially landed.** The **release-on-idle slice** — a voluntary
+> `YieldLease` that stays alive as a follower, plus `Config.OnDemandPromotion` (promotion
+> only on the write path, with an eager-recovery exception for unshipped tails) — has
+> shipped. See INVARIANTS.md #10 and the README's "Release-on-idle" section. The rest of
+> this doc — the `want-write` marker, ticketing, and min/max-hold fairness for a peer that
+> wants the pen while the holder is *actively* writing — **remains parked. Do not implement
+> yet:** it is needed only when a peer wants the pen mid-write, a workload no consumer has.
 
 ## The idea
 

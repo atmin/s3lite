@@ -212,13 +212,22 @@ func TestChaosSingleWriterDurability(t *testing.T) {
 		}
 
 		// Churn phase: one random disruptive op.
-		switch rng.Intn(3) {
+		switch rng.Intn(4) {
 		case 0: // simulated expiry: another owner steals the lock
 			lock.steal("chaos-thief", ttl)
 		case 1: // TryPromote storm on random instances
 			for j := 0; j < 3; j++ {
 				db, _ := slots[rng.Intn(k)].current()
 				_, _ = db.TryPromote(ctx)
+			}
+		case 3: // voluntary yield: the current leader hands the pen back mid-stream
+			if li := leaderIndex(); li >= 0 {
+				db, _ := slots[li].current()
+				yctx, cancel := context.WithTimeout(ctx, settle)
+				// May return ErrNotLeader (it demoted meanwhile) or an aborted-yield error;
+				// the invariants (single writer, no durable regression) must hold regardless.
+				_ = db.YieldLease(yctx)
+				cancel()
 			}
 		case 2: // clean close + reopen a random slot as a fresh instance
 			idx := rng.Intn(k)

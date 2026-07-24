@@ -167,6 +167,53 @@ acquisition is the same lease CAS the loop uses — and is safe to call
 concurrently. It is strictly additive: an instance that never calls it is
 unchanged.
 
+### Release-on-idle: `YieldLease` + `OnDemandPromotion`
+
+By default the holder is **sticky**: it renews until it dies, deploys, or `Close`s, so
+a live-but-idle holder pins the lease and a peer's write is refused (read-only) until a
+handoff. For a **bursty, migratory writer** — write where you are, read everywhere — you
+can invert that: hold the lease only while actively writing, and let whoever writes next
+acquire instantly.
+
+```go
+db, _ := s3lite.Open(ctx, s3lite.Config{
+    // ...
+    Role:              s3lite.RoleAuto,
+    OnDemandPromotion: true, // followers promote only via TryPromote, not in the background
+})
+
+// on the write path:
+if !db.IsLeader() {
+    if ok, err := db.TryPromote(ctx); err != nil || !ok { /* 503: no writer available */ }
+}
+// ... serve the write ...
+
+// when the instance goes idle (the consumer decides), hand the lease back:
+if err := db.YieldLease(ctx); err != nil && !errors.Is(err, s3lite.ErrNotLeader) {
+    // an aborted yield (replica outage) left us still the leader; try again later
+}
+```
+
+`YieldLease` performs a **safe voluntary handoff** and keeps the instance alive as a
+read-only follower: it fences the handle, does a final durable sync, stops replication,
+records a clean-shutdown marker, and only then deletes the lock — so a peer acquiring
+right after sees every acked write (single-writer is never violated). If the final sync
+can't complete before the lease deadline the yield **aborts atomically**: the instance
+stays the leader with renewals running, or — if it can no longer hold the lease — takes
+the standard demote path. A successful yield never fires `OnDemote` (it is a
+relinquishment, not a lost lease); it returns `ErrNotLeader` if the instance is not the
+current holder. A yielded instance that later re-promotes with no interim writer resumes
+in place (no re-download); one that finds a peer wrote in between restores.
+
+`OnDemandPromotion` is what makes a yield worthwhile: without it, this instance's own
+background loop (or an idle peer's) re-acquires the just-freed lock within a tick, so the
+system ping-pongs restores. With it, a follower promotes **only** via an explicit
+`TryPromote` on your write path, so the lock stays free between bursts. `Open`'s direct
+acquire is unchanged (bootstrap and crash re-entry still work), and a crashed ex-leader
+that may hold an unshipped tail keeps recovering eagerly rather than parking it — so
+on-demand mode never turns a crash into silent data loss. Use the two together; a bare
+`YieldLease` without `OnDemandPromotion` is self-defeating.
+
 Followers serve the snapshot they restored at `Open` and always refresh on
 **promotion** (a follower restores the latest state before it starts writing). To
 also serve **near-live reads**, set `Config.FollowerRefreshInterval`: the follower
