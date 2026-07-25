@@ -623,6 +623,56 @@ func TestCachedHandleFencedOnDemote(t *testing.T) {
 	}
 }
 
+// TestReplicationStatusSurvivesStoreSwap pins the carry across a lease handoff:
+// a promote builds a fresh litestream DB whose own LastSuccessfulSyncAt restarts
+// at zero, but the replica has not un-synced — so ReplicationStatus must keep
+// reporting the last real sync, not read as never-synced. Regression: a
+// re-promoted writer that misreported never-synced tripped a downstream health
+// monitor into fencing its very first write.
+func TestReplicationStatusSurvivesStoreSwap(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "db.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('one')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := db.ReplicationStatus().LastSyncAt
+	if before.IsZero() {
+		t.Fatal("precondition: LastSyncAt should be set after a Sync")
+	}
+
+	// Swap the litestream store exactly as a demote→promote does: stop drops the
+	// synced store, start builds a fresh one whose own sync time is zero. The
+	// canceled context stops without a final network sync — that erroring is by
+	// design, so the stop return is ignored here as the real demote path does.
+	db.mu.Lock()
+	_ = db.stopReplicationLocked(canceledContext())
+	err = db.startReplicationLocked(ctx)
+	db.mu.Unlock()
+	if err != nil {
+		t.Fatalf("restart replication: %v", err)
+	}
+
+	after := db.ReplicationStatus().LastSyncAt
+	if after.IsZero() {
+		t.Fatal("LastSyncAt reset to zero after a store swap — a re-promoted writer misreads as never-synced")
+	}
+	if !after.Equal(before) {
+		t.Errorf("LastSyncAt = %v after swap, want the carried %v", after, before)
+	}
+}
+
 func TestTryPromoteConcurrentSingleFlight(t *testing.T) {
 	// N concurrent TryPromote calls on a follower whose lease is free must produce
 	// exactly one restore/promote (single-flight under promoteMu) and all return

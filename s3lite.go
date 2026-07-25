@@ -221,9 +221,15 @@ type S3Config struct {
 //     gated on IsLeader.
 type DB struct {
 	*sql.DB
-	connector           *stableConnector
-	lsDB                *litestream.DB
-	store               *litestream.Store
+	connector *stableConnector
+	lsDB      *litestream.DB
+	store     *litestream.Store
+	// lastSyncAt carries the replica's last successful sync across lease
+	// handoffs. A promote builds a fresh litestream DB whose own
+	// LastSuccessfulSyncAt starts at zero, so ReplicationStatus floors on this
+	// (updated at demote) — else a writer that just re-promoted reads as
+	// never-synced though its replica is caught up. Guarded by mu.
+	lastSyncAt          time.Time
 	shutdownSyncTimeout time.Duration
 
 	// Fields below support leased instances and are unused without an s3:// BackupTo.
@@ -888,13 +894,21 @@ func (db *DB) ReplicationStatus() ReplicationStatus {
 	// (→ nil) both write it under mu, so an unlocked read races a role change.
 	db.mu.Lock()
 	lsDB := db.lsDB
+	carried := db.lastSyncAt
 	db.mu.Unlock()
 	if lsDB == nil {
 		return ReplicationStatus{}
 	}
+	// Floor the live store's sync time on the value carried across the last
+	// handoff: a store built at promote reports zero until its first sync, but
+	// the replica itself last advanced at `carried`, so that is the honest time.
+	lastSync := lsDB.LastSuccessfulSyncAt()
+	if lastSync.Before(carried) {
+		lastSync = carried
+	}
 	st := ReplicationStatus{
 		Replicating: true,
-		LastSyncAt:  lsDB.LastSuccessfulSyncAt(),
+		LastSyncAt:  lastSync,
 		LastError:   lsDB.SyncDiagnostic().Error,
 	}
 	if pos, err := lsDB.Pos(); err == nil {

@@ -149,6 +149,15 @@ func (db *DB) stopReplicationLocked(ctx context.Context) error {
 	if db.store != nil {
 		err = db.store.Close(ctx)
 	}
+	// Carry the replica's last successful sync forward before dropping the store:
+	// the next promote builds a fresh litestream DB whose timestamp restarts at
+	// zero, and ReplicationStatus floors on this so a re-promoted writer is not
+	// misread as never-synced (which a health monitor would treat as a stall).
+	if db.lsDB != nil {
+		if at := db.lsDB.LastSuccessfulSyncAt(); at.After(db.lastSyncAt) {
+			db.lastSyncAt = at
+		}
+	}
 	db.store = nil
 	db.lsDB = nil
 	return err
