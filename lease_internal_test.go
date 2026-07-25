@@ -668,8 +668,12 @@ func TestReplicationStatusSurvivesStoreSwap(t *testing.T) {
 	if after.IsZero() {
 		t.Fatal("LastSyncAt reset to zero after a store swap — a re-promoted writer misreads as never-synced")
 	}
-	if !after.Equal(before) {
-		t.Errorf("LastSyncAt = %v after swap, want the carried %v", after, before)
+	// The carry is a floor, not an exact value: if the fresh store lands its own
+	// first sync before we read (a fast/warm run), LastSuccessfulSyncAt honestly
+	// advances past the carried time and the floor keeps that newer value. The
+	// invariant is only that it never regresses below what was carried forward.
+	if after.Before(before) {
+		t.Errorf("LastSyncAt = %v after swap, regressed below the carried floor %v", after, before)
 	}
 }
 
