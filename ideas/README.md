@@ -17,3 +17,7 @@ it isn't a task yet (the tradeoff, the constraint, or the missing prerequisite).
 - [forwarded-writes.md](forwarded-writes.md) — followers forward writes to the
   current leader (rqlite-style) for a multi-writer *feel* with one physical writer.
   **Do not implement yet** — platform-dependent and against the scale-to-zero grain.
+- [restore-progress-callback.md](restore-progress-callback.md) — a
+  `Config.OnRestoreProgress` callback for a live restore %/ETA and stall detection.
+  **Do not implement yet** — needs a litestream-fork progress hook, and no consumer
+  wants a bar over the restore-observability logging yet.

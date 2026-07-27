@@ -3,8 +3,9 @@
 Intended-to-implement units of work, each self-contained (pickable without prior
 context). Delete a file once it lands.
 
-(No scheduled tasks right now — see [../ideas/](../ideas/) for directions captured but
-not scheduled.)
+- [restore-observability.md](restore-observability.md) — log the restore operation as a
+  lifecycle event on the application logger; the initial cold restore on first `Open` is
+  silent today. A live progress callback is noted but deferred (needs a litestream-fork hook).
 
 (Landed: **yield-lease** — `YieldLease` (a leader-only voluntary release-on-idle handoff
 that fences → final-syncs → stops replication → writes the clean-shutdown marker →
