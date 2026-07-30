@@ -6,6 +6,10 @@ context). Delete a file once it lands.
 - [restore-observability.md](restore-observability.md) — log the restore operation as a
   lifecycle event on the application logger; the initial cold restore on first `Open` is
   silent today. A live progress callback is noted but deferred (needs a litestream-fork hook).
+- [encrypted-replica.md](encrypted-replica.md) — opt-in client-side encryption of the LTX
+  objects under `BackupTo` (framed AEAD in a `ReplicaClient` decorator), so the bucket
+  operator holds only ciphertext. Needs a second carried fork patch, which turns
+  `../LITESTREAM-FORK.md` into a patch ledger with an automated upstream sync.
 
 (Landed: **yield-lease** — `YieldLease` (a leader-only voluntary release-on-idle handoff
 that fences → final-syncs → stops replication → writes the clean-shutdown marker →
