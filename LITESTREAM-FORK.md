@@ -84,11 +84,17 @@ already runs the full test + integration suites on every PR — and a human merg
 green. That also preserves the old doc's "moving the base is a pin change, re-verify"
 rule without anyone having to remember it.
 
-Two one-time setup notes for whoever wires the secrets:
+Setup and operational notes:
 
-- GitHub fires `schedule` only from a repository's **default branch**, so the fork's
-  default branch must be `s3lite` for the weekly run to happen. Until then
-  `workflow_dispatch` and the manual commands below still work.
+- GitHub fires `schedule` only from a repository's **default branch**. The fork's
+  default branch is therefore `s3lite`, not `main` (`main` stays as the plain upstream
+  mirror). Done — noted because renaming or re-pointing it silently stops the weekly
+  run, and `workflow_dispatch` would be the only thing left working.
+- **A quiet repo disables its own schedule.** GitHub disables scheduled workflows after
+  60 days without repository activity. The sync only commits when upstream cuts a
+  release, so a two-month-quiet upstream can get the weekly run switched off; GitHub
+  emails the repo admin, and re-enabling is a button in the fork's Actions tab.
+  `workflow_dispatch` is unaffected. If the pin ever looks stale, check this first.
 - Cross-repo `repository_dispatch` and PR creation need a PAT (`GITHUB_TOKEN` is
   repo-scoped): `S3LITE_DISPATCH_TOKEN` on the fork, and the pin workflow's PR
   creation uses the repo's own `GITHUB_TOKEN` with `pull-requests: write`. Tag pushes
