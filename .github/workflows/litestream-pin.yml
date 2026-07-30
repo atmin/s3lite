@@ -34,6 +34,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Same reason as the PR step below: the push has to be attributed to the PAT
+          # for ci.yml to run on the branch.
+          token: ${{ secrets.LITESTREAM_PIN_TOKEN || github.token }}
 
       - uses: actions/setup-go@v5
         with:
@@ -87,14 +91,27 @@ jobs:
           go build ./...
           go vet ./...
 
+      # The branch push and the PR both use the PAT, not GITHUB_TOKEN: GitHub does not
+      # start workflow runs from events created by GITHUB_TOKEN, so a PR opened with it
+      # would never run ci.yml — and this workflow's whole premise is that the bot PR's
+      # CI is what qualifies the new pin. Without the PAT, stop and say so rather than
+      # open a PR that silently has no checks.
       - name: Open the PR
         if: steps.bump.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.LITESTREAM_PIN_TOKEN }}
           BASE: ${{ steps.pin.outputs.base }}
           TAG: ${{ steps.pin.outputs.tag }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "LITESTREAM_PIN_TOKEN is not set. Refusing to open a PR with" \
+                 "GITHUB_TOKEN, because CI would not run on it. Bump the pin by hand:" >&2
+            echo "  go get github.com/benbjohnson/litestream@$BASE" >&2
+            echo "  go mod edit -replace=github.com/benbjohnson/litestream=github.com/atmin/litestream@$TAG" >&2
+            echo "  go mod tidy" >&2
+            exit 1
+          fi
           BRANCH="bot/litestream-pin-$TAG"
           git config user.name "litestream-pin[bot]"
           git config user.email "litestream-pin@users.noreply.github.com"

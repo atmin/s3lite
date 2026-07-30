@@ -95,11 +95,31 @@ Setup and operational notes:
   release, so a two-month-quiet upstream can get the weekly run switched off; GitHub
   emails the repo admin, and re-enabling is a button in the fork's Actions tab.
   `workflow_dispatch` is unaffected. If the pin ever looks stale, check this first.
-- Cross-repo `repository_dispatch` and PR creation need a PAT (`GITHUB_TOKEN` is
-  repo-scoped): `S3LITE_DISPATCH_TOKEN` on the fork, and the pin workflow's PR
-  creation uses the repo's own `GITHUB_TOKEN` with `pull-requests: write`. Tag pushes
-  need `contents: write`. Without the PAT the sync still cuts the tag and just tells
-  you to bump the pin by hand.
+- **The automation needs one PAT, stored in both repos.** `GITHUB_TOKEN` cannot do
+  either half: it is repo-scoped, so it cannot dispatch across repos, and GitHub does
+  not start workflow runs from events it creates — so a PR opened with it would have no
+  CI, which is the one thing this design leans on. Create a **fine-grained PAT** whose
+  only resource is `atmin/s3lite`, with `Contents: read and write` (dispatch + the bot
+  branch push) and `Pull requests: read and write` (open the PR), then store the same
+  value as an Actions secret in two places:
+
+  | repo | secret | used for |
+  |---|---|---|
+  | `atmin/litestream` | `S3LITE_DISPATCH_TOKEN` | `repository_dispatch` into s3lite |
+  | `atmin/s3lite` | `LITESTREAM_PIN_TOKEN` | the branch push + `gh pr create`, so `ci.yml` runs |
+
+  Neither half is load-bearing: without the dispatch token the sync still cuts the tag
+  and tells you to bump the pin by hand, and without the pin token the pin workflow
+  refuses to open a check-less PR and prints the three commands instead. Fine-grained
+  PATs expire — put the renewal date somewhere you will see it, because the symptom is
+  a silently un-bumped pin.
+
+  Verify without waiting for an upstream release: run s3lite's `litestream-pin`
+  workflow manually with the current base and tag (it exits early as "already pinned",
+  which still proves the token and the input validation), and test the dispatch leg
+  with `curl -sSf -X POST -H "Authorization: Bearer $PAT" -H "Accept:
+  application/vnd.github+json" https://api.github.com/repos/atmin/s3lite/dispatches -d
+  '{"event_type":"litestream-pin","client_payload":{"base":"v0.5.15","tag":"v0.5.15-s3lite.3"}}'`.
 
 ## Doing it by hand (the escape hatch)
 
