@@ -2,6 +2,8 @@ package s3lite
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -63,6 +65,20 @@ func newLeaser(ctx context.Context, s3cfg S3Config, backupURL string, ttl time.D
 	leaser.SetClient(client)
 	leaser.SetLogger(logger)
 	return leaser, nil
+}
+
+// opaqueOwnerID is the lease owner an encrypted instance publishes when the caller
+// left Config.Owner empty: 16 random bytes, hex. This is lease policy, not part of the
+// object format — litestream's default owner is hostname-derived, and an operator who
+// encrypts the replica generally does not want machine names readable in lock.json.
+// That object is not on the replica client's path and stays plaintext by design; the
+// owner is the one field in it worth not publishing (see the README).
+func opaqueOwnerID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("s3lite: generate opaque lease owner: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // newS3APIClient builds an S3 client for the leaser from S3Config, mirroring
@@ -375,7 +391,7 @@ func (db *DB) doYield(ctx context.Context) error {
 	// costs a re-promote/restart a conservative restore, never a wrong resume. The same
 	// probe seeds lastRefreshPos so the first follower-refresh tick is a no-op unless a
 	// successor writes.
-	syncedTXID, probeErr := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	syncedTXID, probeErr := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
 	if probeErr != nil {
 		db.logger.Warn("s3lite: yield: reading synced replica position failed; a restart/re-promote will restore", "error", probeErr)
 		syncedTXID = 0
@@ -596,7 +612,7 @@ func (db *DB) seedRefreshPos(ctx context.Context) {
 	if db.cfg.FollowerRefreshInterval <= 0 || db.leaser == nil {
 		return
 	}
-	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
 	if err != nil {
 		db.logger.Warn("s3lite: seeding follower refresh position failed; first refresh may be redundant", "error", err)
 		return
@@ -626,7 +642,7 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 		return nil
 	}
 
-	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
 	if err != nil {
 		return err
 	}
@@ -637,7 +653,7 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 	// Advance the private follow file (no SQLite reader opens it) to the replica's
 	// latest by applying only the delta. A failure here leaves the live read file
 	// untouched — the follower keeps serving its current state — so we just return.
-	reached, err := advanceFollowFileFunc(ctx, db.cfg.S3, db.cfg.BackupTo, db.followPath(), pos)
+	reached, err := advanceFollowFileFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, db.followPath(), pos)
 	if err != nil {
 		return err
 	}
@@ -745,7 +761,7 @@ func (db *DB) rebuildLocalFromReplica(ctx context.Context) error {
 	if err := removeLocalDBFiles(tmp); err != nil {
 		return fmt.Errorf("s3lite: rebuild: clear stale temp: %w", err)
 	}
-	if err := restoreDBFunc(ctx, db.cfg.S3, db.cfg.BackupTo, tmp); err != nil {
+	if err := restoreDBFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, tmp); err != nil {
 		// Restore failed without touching the live files: keep serving current state.
 		return fmt.Errorf("s3lite: rebuild: restore: %w", err)
 	}
@@ -943,7 +959,7 @@ func (db *DB) cleanMarkerResumeOK(ctx context.Context) bool {
 	if !ok {
 		return false
 	}
-	latest, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo)
+	latest, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
 	switch {
 	case err != nil:
 		db.logger.Warn("s3lite: will restore; clean-shutdown replica probe failed", "error", err)
@@ -1035,7 +1051,7 @@ func (db *DB) restoreLocalFromReplica(ctx context.Context) error {
 	if err := removeLitestreamMeta(path); err != nil {
 		return fmt.Errorf("s3lite: open restore: clear litestream state: %w", err)
 	}
-	if err := restoreDBFunc(ctx, db.cfg.S3, db.cfg.BackupTo, path); err != nil {
+	if err := restoreDBFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, path); err != nil {
 		return fmt.Errorf("s3lite: open restore: %w", err)
 	}
 	return precreateWAL(ctx, path)

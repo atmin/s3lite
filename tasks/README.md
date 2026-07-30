@@ -6,12 +6,20 @@ context). Delete a file once it lands.
 - [restore-observability.md](restore-observability.md) — log the restore operation as a
   lifecycle event on the application logger; the initial cold restore on first `Open` is
   silent today. A live progress callback is noted but deferred (needs a litestream-fork hook).
-- [encrypted-replica.md](encrypted-replica.md) — opt-in client-side encryption of the LTX
-  objects under `BackupTo` (framed AEAD in a `ReplicaClient` decorator), so the bucket
-  operator holds only ciphertext. Needs a second carried fork patch, which turns
-  `../LITESTREAM-FORK.md` into a patch ledger with an automated upstream sync.
 
-(Landed: **yield-lease** — `YieldLease` (a leader-only voluntary release-on-idle handoff
+(Landed: **encrypted-replica** — opt-in `Config.EncryptionKey` client-side-encrypts every
+LTX object under `BackupTo` (framed ChaCha20-Poly1305 in a `ReplicaClient` decorator
+installed at `newReplicaClient`, the one seam every path funnels through), so the bucket
+operator holds only ciphertext; plaintext sizes are reported upward by exact arithmetic
+because litestream treats a listed size as load-bearing, each frame's key is derived from
+the object's identity so a body cannot be moved between object names, and a wrong/absent
+key is a typed error rather than a corrupt-looking database. `RequireEncrypted` closes the
+plaintext-downgrade path once a previously-plaintext replica has aged out. The fork gained
+its second patch — `WriteLTXFile` accepting the LTX timestamp from the body, since
+ciphertext cannot be peeked — which made the fork permanent, so `../LITESTREAM-FORK.md` is
+now a patch ledger with an automated weekly rebase-and-tag sync whose bot PR is verified by
+the existing CI; INVARIANTS.md #11.
+**yield-lease** — `YieldLease` (a leader-only voluntary release-on-idle handoff
 that fences → final-syncs → stops replication → writes the clean-shutdown marker →
 releases last, staying alive as a follower; aborts atomically on a sync failure/deadline
 and never fires `OnDemote`) + `Config.OnDemandPromotion` (a follower promotes only via

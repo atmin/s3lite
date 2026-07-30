@@ -8,7 +8,7 @@ import (
 )
 
 func TestNewReplicaClientS3(t *testing.T) {
-	client, err := newReplicaClient(S3Config{Region: "us-east-1"}, "s3://my-bucket/some/path")
+	client, err := newReplicaClient(replicaConfig{S3: S3Config{Region: "us-east-1"}}, "s3://my-bucket/some/path")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,12 +34,12 @@ func TestNewReplicaClientS3(t *testing.T) {
 }
 
 func TestNewReplicaClientS3CustomEndpoint(t *testing.T) {
-	client, err := newReplicaClient(S3Config{
+	client, err := newReplicaClient(replicaConfig{S3: S3Config{
 		Region:          "us-east-1",
 		Endpoint:        "http://localhost:9000",
 		AccessKeyID:     "minioadmin",
 		SecretAccessKey: "minioadmin",
-	}, "s3://test/smokedb")
+	}}, "s3://test/smokedb")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,14 +56,14 @@ func TestNewReplicaClientS3CustomEndpoint(t *testing.T) {
 }
 
 func TestNewReplicaClientS3RequiresBucket(t *testing.T) {
-	_, err := newReplicaClient(S3Config{}, "s3:///just/a/path")
+	_, err := newReplicaClient(replicaConfig{}, "s3:///just/a/path")
 	if err == nil {
 		t.Fatal("expected error for missing bucket")
 	}
 }
 
 func TestNewReplicaClientUnknownScheme(t *testing.T) {
-	_, err := newReplicaClient(S3Config{}, "ftp://host/path")
+	_, err := newReplicaClient(replicaConfig{}, "ftp://host/path")
 	if err == nil {
 		t.Fatal("expected error for unknown scheme")
 	}

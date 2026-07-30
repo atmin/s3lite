@@ -44,6 +44,23 @@ func (s *chaosSlot) current() (*DB, int) {
 // simply never recorded — "allowed lost". The seed is fixed for reproducibility and
 // printed on every failure.
 func TestChaosSingleWriterDurability(t *testing.T) {
+	runChaosSingleWriterDurability(t, nil)
+}
+
+// TestChaosSingleWriterDurabilityEncrypted runs the same soak with a
+// Config.EncryptionKey set, so the lifecycle is exercised end-to-end against a replica
+// the instances can only read through the decrypting client: lease handoffs, promote
+// restores, follower refreshes, and the final restore all go through encryption. The
+// invariants asserted are identical — encryption must not disturb any of them.
+func TestChaosSingleWriterDurabilityEncrypted(t *testing.T) {
+	key := make([]byte, encKeySize)
+	for i := range key {
+		key[i] = byte(0x5a ^ i)
+	}
+	runChaosSingleWriterDurability(t, key)
+}
+
+func runChaosSingleWriterDurability(t *testing.T, encryptionKey []byte) {
 	const (
 		seed  = 1
 		k     = 4
@@ -100,6 +117,7 @@ func TestChaosSingleWriterDurability(t *testing.T) {
 			Owner:                   name,
 			LeaseTTL:                ttl,
 			FollowerRefreshInterval: refresh,
+			EncryptionKey:           encryptionKey,
 			Migrations:              []string{itemsSchema},
 		})
 		if err != nil {
@@ -264,8 +282,9 @@ func TestChaosSingleWriterDurability(t *testing.T) {
 	// A fresh instance restored from the replica must be intact and hold every
 	// durable row.
 	final, err := Open(ctx, Config{
-		LocalPath:   filepath.Join(t.TempDir(), "final.sqlite3"),
-		RestoreFrom: replicaURL,
+		LocalPath:     filepath.Join(t.TempDir(), "final.sqlite3"),
+		RestoreFrom:   replicaURL,
+		EncryptionKey: encryptionKey,
 	})
 	if err != nil {
 		t.Fatalf("final restore (seed %d): %v", seed, err)

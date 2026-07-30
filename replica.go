@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -15,19 +17,57 @@ import (
 	"github.com/superfly/ltx"
 )
 
-func newReplicaClient(s3Cfg S3Config, rawURL string) (litestream.ReplicaClient, error) {
+// replicaConfig is the subset of Config the replica-client constructors need: the
+// S3 connection settings plus the client-side encryption options. It travels as one
+// value because every replica path — replicate, restore, the follower's incremental
+// advance, the latest-TXID probe — needs all of it.
+type replicaConfig struct {
+	S3               S3Config
+	EncryptionKey    []byte
+	RequireEncrypted bool
+}
+
+// replica projects the replica-facing subset out of Config.
+func (cfg Config) replica() replicaConfig {
+	return replicaConfig{
+		S3:               cfg.S3,
+		EncryptionKey:    cfg.EncryptionKey,
+		RequireEncrypted: cfg.RequireEncrypted,
+	}
+}
+
+// newReplicaClient is the only constructor of a replica client, which is what makes
+// it the single seam for client-side encryption: replication (s3lite.go), restore,
+// the follower advance and the latest-TXID probe all come through here, and so does
+// remote compaction (it uses the store's client). With Config.EncryptionKey set the
+// client is wrapped in the encrypting decorator; with it empty nothing is wrapped
+// and the returned client is byte-for-byte the one this package always used.
+func newReplicaClient(cfg replicaConfig, rawURL string) (litestream.ReplicaClient, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("s3lite: invalid replica URL: %w", err)
 	}
+
+	var client litestream.ReplicaClient
 	switch u.Scheme {
 	case "file":
-		return litestream.NewReplicaClientFromURL(rawURL)
+		if client, err = litestream.NewReplicaClientFromURL(rawURL); err != nil {
+			return nil, err
+		}
 	case "s3":
-		return newS3ReplicaClient(s3Cfg, u)
+		sc, err := newS3ReplicaClient(cfg.S3, u)
+		if err != nil {
+			return nil, err
+		}
+		client = sc
 	default:
 		return nil, fmt.Errorf("s3lite: unsupported replica scheme %q (supported: file, s3)", u.Scheme)
 	}
+
+	if len(cfg.EncryptionKey) == 0 {
+		return client, nil
+	}
+	return newEncryptedClient(client, cfg.EncryptionKey, cfg.RequireEncrypted), nil
 }
 
 func newS3ReplicaClient(s3Cfg S3Config, u *url.URL) (*lss3.ReplicaClient, error) {
@@ -55,9 +95,103 @@ func isEmptyReplica(err error) bool {
 
 // wireReplica sets the back-reference on client types that require it.
 func wireReplica(client litestream.ReplicaClient, replica *litestream.Replica) {
-	if fc, ok := client.(*file.ReplicaClient); ok {
+	if fc, ok := unwrapReplicaClient(client).(*file.ReplicaClient); ok {
 		fc.Replica = replica
 	}
+}
+
+// unwrapReplicaClient peels decorators (the encrypting client) off so the few
+// callers that need the concrete backend type still find it. It is the alternative
+// to wrapping after wiring, and it keeps newReplicaClient the single seam.
+func unwrapReplicaClient(client litestream.ReplicaClient) litestream.ReplicaClient {
+	for {
+		u, ok := client.(interface {
+			Unwrap() litestream.ReplicaClient
+		})
+		if !ok {
+			return client
+		}
+		client = u.Unwrap()
+	}
+}
+
+// annotateEncryptionError names an encryption cause behind an already-failed read.
+//
+// It exists because litestream cannot carry ours up: `ltx.Compact` (v0.5.1) reads
+// each input's header under a named return and, on failure, does a bare `return` —
+// so the error is dropped and the closed output pipe surfaces as
+// "decode database: decode header: EOF" no matter what the input actually did. A
+// forgotten or wrong key would therefore read exactly like a corrupt database, which
+// is the one thing this feature must never look like.
+//
+// So on failure — only on failure, the happy path pays nothing — re-open the objects
+// the restore plan used under the configured settings and report what they say.
+func annotateEncryptionError(ctx context.Context, cfg replicaConfig, rawURL string, err error) error {
+	// A cancelled context is a shutdown, not a configuration problem — and the probe
+	// would fail on it anyway. Skipping it also keeps a repeatedly-failing follower
+	// refresh from adding a listing round trip per tick.
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if cause := probeEncryptionCause(ctx, cfg, rawURL); cause != nil {
+		// Both are wrapped: the caller needs errors.Is on the typed cause, and the
+		// original failure is what actually happened.
+		return fmt.Errorf("%w: %w", cause, err)
+	}
+	return err
+}
+
+// probeEncryptionCause returns the typed error the replica's own restore-plan objects
+// produce under cfg, or nil when they read fine (so the failure was something else).
+// Best-effort by construction: it is a diagnostic, so anything that goes wrong along
+// the way just means "cannot tell".
+func probeEncryptionCause(ctx context.Context, cfg replicaConfig, rawURL string) error {
+	client, err := newReplicaClient(cfg, rawURL)
+	if err != nil || client.Init(ctx) != nil {
+		return nil
+	}
+	infos, err := litestream.CalcRestorePlan(ctx, client, 0, time.Time{}, slog.New(slog.DiscardHandler))
+	if err != nil || len(infos) == 0 {
+		return nil
+	}
+	// Only the ends of the plan, never all of it: this runs on a failure that may
+	// repeat every follower-refresh tick, and sweeping the whole plan would cost a GET
+	// per object each time. Encryption is a whole-replica property, so either end
+	// answers it — and the two ends are exactly what the mixed window straddles, the
+	// oldest object being the one most likely to predate the key.
+	for _, info := range []*ltx.FileInfo{infos[0], infos[len(infos)-1]} {
+		if cause := probeEncryptionCauseForObject(ctx, cfg, client, info); cause != nil {
+			return cause
+		}
+	}
+	return nil
+}
+
+// probeEncryptionCauseForObject classifies one object against the configured
+// encryption settings.
+func probeEncryptionCauseForObject(ctx context.Context, cfg replicaConfig, client litestream.ReplicaClient, info *ltx.FileInfo) error {
+	rc, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrKeyMismatch):
+			return ErrKeyMismatch
+		case errors.Is(err, ErrObjectNotEncrypted):
+			return ErrObjectNotEncrypted
+		}
+		return nil
+	}
+	defer func() { _ = rc.Close() }()
+
+	if len(cfg.EncryptionKey) > 0 {
+		return nil // it opened, so its first frame authenticated under our key
+	}
+	// With no key nothing is wrapped, so the object arrives raw and its magic says
+	// whether a key was needed.
+	magic := make([]byte, len(encMagic))
+	if n, _ := io.ReadFull(rc, magic); n == len(encMagic) && string(magic) == encMagic {
+		return ErrReplicaEncrypted
+	}
+	return nil
 }
 
 // replicaLatestTXIDFunc is the "latest replica position" probe used by follower
@@ -71,8 +205,8 @@ var replicaLatestTXIDFunc = replicaLatestTXID
 // no-op restores. It builds a throwaway client each call (like restoreDB), so it
 // never shares state with a live writer's replication. It lists every level so a
 // transaction that has been compacted upward (out of level 0) is still seen.
-func replicaLatestTXID(ctx context.Context, s3Cfg S3Config, rawURL string) (ltx.TXID, error) {
-	client, err := newReplicaClient(s3Cfg, rawURL)
+func replicaLatestTXID(ctx context.Context, cfg replicaConfig, rawURL string) (ltx.TXID, error) {
+	client, err := newReplicaClient(cfg, rawURL)
 	if err != nil {
 		return 0, err
 	}
@@ -100,8 +234,8 @@ func replicaLatestTXID(ctx context.Context, s3Cfg S3Config, rawURL string) (ltx.
 // restoreDB directly, so injecting here isolates the refresh/promote rebuild.
 var restoreDBFunc = restoreDB
 
-func restoreDB(ctx context.Context, s3Cfg S3Config, rawURL, destPath string) error {
-	client, err := newReplicaClient(s3Cfg, rawURL)
+func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string) error {
+	client, err := newReplicaClient(cfg, rawURL)
 	if err != nil {
 		return err
 	}
@@ -112,7 +246,7 @@ func restoreDB(ctx context.Context, s3Cfg S3Config, rawURL, destPath string) err
 		if isEmptyReplica(err) {
 			return nil
 		}
-		return fmt.Errorf("s3lite: restore: %w", err)
+		return annotateEncryptionError(ctx, cfg, rawURL, fmt.Errorf("s3lite: restore: %w", err))
 	}
 	return nil
 }
@@ -145,8 +279,8 @@ var advanceFollowFileFunc = advanceFollowFile
 // position the replica has pruned past (retention). Both are detected up front by
 // followNeedsReestablish, so we never depend on litestream's non-sentinel resume-error
 // text.
-func advanceFollowFile(ctx context.Context, s3Cfg S3Config, rawURL, followPath string, target ltx.TXID) (ltx.TXID, error) {
-	client, err := newReplicaClient(s3Cfg, rawURL)
+func advanceFollowFile(ctx context.Context, cfg replicaConfig, rawURL, followPath string, target ltx.TXID) (ltx.TXID, error) {
+	client, err := newReplicaClient(cfg, rawURL)
 	if err != nil {
 		return 0, err
 	}
@@ -167,7 +301,7 @@ func advanceFollowFile(ctx context.Context, s3Cfg S3Config, rawURL, followPath s
 
 	reached, err := runManagedFollow(ctx, replica, followPath, target)
 	if err != nil {
-		return reached, fmt.Errorf("s3lite: follow: %w", err)
+		return reached, annotateEncryptionError(ctx, cfg, rawURL, fmt.Errorf("s3lite: follow: %w", err))
 	}
 	return reached, nil
 }

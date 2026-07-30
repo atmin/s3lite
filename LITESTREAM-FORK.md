@@ -1,62 +1,114 @@
-# litestream fork
+# litestream fork — the patch ledger
 
-s3lite depends on a **fork** of litestream, not the upstream release, to carry one
-small fix. This doc explains why, how it's wired, how to keep it current, and how to
-drop it. If you just want to build s3lite, you don't need to do anything — the fork is
+s3lite depends on a **fork** of litestream, not the upstream release, to carry a small
+set of patches. If you just want to build s3lite you need do nothing: the fork is
 pinned in `go.mod`/`go.sum` and resolves automatically.
 
-## Why the fork exists
+The fork used to be temporary — one commit, one open upstream PR, "drop it when the PR
+merges". One of the patches it now carries has no upstream release to wait for, so the
+fork is **permanent infrastructure**. This doc is therefore a ledger of what is carried
+and why, plus the automation that makes carrying it cost nothing. The exit workflow is
+"drop a patch", not "drop the fork".
 
-litestream's follow-mode crash-recovery **rejected resuming** whenever the saved
-`-txid` was ahead of the *latest snapshot* — which is the normal steady state, since
-snapshots default to every 24h while deltas are continuous. That rejection blocks the
-incremental follower-refresh work (see `tasks/incremental-follower-refresh.md`): every
-resume would fall back to a full snapshot re-download.
+## The ledger
 
-The fix bounds the check by the newest TXID across *all* levels instead of just the
-latest snapshot. It's ~23 lines in `replica.go` plus a regression test
-(`TestReplica_Restore_Follow_ResumeAheadOfSnapshot`).
+One row per carried commit, in apply order. The fork lives while any row is open.
 
-An upstream PR to `benbjohnson/litestream` is open for this fix. **Upstream PR:**
-[benbjohnson/litestream#1385](https://github.com/benbjohnson/litestream/pull/1385).
-Until it merges and ships in a release, we carry the fork.
+| # | patch | why s3lite needs it | status |
+|---|---|---|---|
+| 1 | follow-mode resume ahead of snapshot | litestream refused to resume follow mode whenever the saved `-txid` was ahead of the *latest snapshot* — which is the normal steady state (snapshots default to 24h, deltas are continuous). Without it every incremental follower refresh degrades to a full snapshot re-download. Pins: `TestReplica_Restore_Follow_ResumeAheadOfSnapshot`. | **upstream PR [#1385](https://github.com/benbjohnson/litestream/pull/1385) open** — drop this row when it ships in a release |
+| 2 | caller-supplied LTX timestamp on `WriteLTXFile` | Every backend records the LTX header's timestamp as object metadata (timestamp-based restore and retention read it back) and obtains it by teeing the upload through `ltx.PeekHeader`. That makes "the body is a readable LTX stream" a hard requirement, so a caller that *transforms* the bytes on the way out — s3lite's client-side encryption — cannot use `WriteLTXFile` at all. The patch adds an optional `litestream.LTXTimestamper` interface on the body: implement it and the backend takes the timestamp from the caller and uploads verbatim; otherwise it peeks exactly as before. Pins: `TestReplicaClient_WriteLTXFile_LTXTimestamp` in both `s3/` and `file/`. | **carried** — propose upstream as the generic body-transform seam (it is equally the hook compression would need) |
+
+Patch 2 is inert for every existing consumer: today's callers pass an `*os.File`
+(`replica.go`), an `io.PipeReader` (`compactor.go`) and the snapshot reader (`db.go`),
+none of which implement the interface, so they all keep the peek path.
+
+The branch also carries **fork infrastructure** commits, which are not ledger rows
+because they change no library behaviour and never need to go upstream: the sync
+workflow and `patches/` themselves, plus a one-line
+`if: github.repository == 'benbjohnson/litestream'` guard on upstream's tag- and
+schedule-triggered workflows. That guard exists because a `v*` tag push runs upstream's
+`release.yml`, which fails trying to publish a GitHub release to `benbjohnson/litestream`
+— noise on every tag the sync cuts, and plainly wrong if it ever succeeded. The fork
+publishes nothing but its own tags.
 
 ## How it's wired
 
-- Fork repo: `github.com/atmin/litestream`.
+- Fork repo: `github.com/atmin/litestream`, branch **`s3lite`** = newest upstream
+  release tag + the ledger's commits in order.
 - The fork's `go.mod` intentionally **keeps `module github.com/benbjohnson/litestream`**
-  (unchanged). That is what lets a `replace` by module path work without touching any
-  import in s3lite.
+  (unchanged). That is what lets a `replace` by module path work without touching a
+  single import in s3lite.
 - s3lite `go.mod`:
 
   ```
   require github.com/benbjohnson/litestream v0.5.15          // the base we track
-  replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.15-s3lite.1
+  replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.15-s3lite.3
   ```
 
-- The consumed ref is an **immutable tag** `v0.5.15-s3lite.1` = upstream `v0.5.15` +
-  the single fix commit. A tag (not a branch) decouples s3lite from any force-push to
-  the fork's PR branch and keeps `go.sum` reproducible; no submodule, no vendoring, no
-  special CI steps.
+- The consumed ref is an **immutable tag** — `v0.5.15-s3lite.3` is upstream `v0.5.15`
+  plus the ledger. A tag (not a branch) keeps `go.sum` reproducible and decouples
+  s3lite from any force-push to the fork; no submodule, no vendoring, no special CI.
+- The tag name encodes its own base (`v0.5.15-s3lite.3` sits on `v0.5.15`), which is
+  why the sync automation below needs no state file to know what to rebase from.
+- `patches/` in the fork holds `git format-patch` output for the series, so a lost
+  branch is a `git am --3way` away.
 
-### Branches on the fork
+### Other branches on the fork
 
-- `fix/follow-resume-ahead-of-snapshot` — the PR branch, based on upstream `main`.
-  **Leave it based on `main`** for the upstream PR; don't rebase it onto a release tag.
-- The `v0.5.15-s3lite.N` tags are what s3lite consumes.
+- `fix/follow-resume-ahead-of-snapshot` — the upstream PR branch for row 1, based on
+  upstream `main`. **Leave it based on `main`**; don't rebase it onto a release tag.
+- `main` — a plain mirror of upstream.
 
-## Sync workflow (pull in new upstream releases)
+## Automated sync
 
-When upstream cuts a new release and you want it under the fix (the fix is still
-unmerged), rebase the one fix commit onto the new version and cut the next tag:
+`.github/workflows/sync-upstream.yml` in the fork runs weekly (and on
+`workflow_dispatch`) and does the whole rebase-and-tag dance:
+
+1. Fetch upstream tags. `NEW` = newest non-prerelease upstream release; `OLD` = the
+   base encoded in the newest `*-s3lite.*` tag. Exit if they match.
+2. `git rebase --onto $NEW $OLD s3lite`.
+3. **Conflict → open an issue with the conflict state and stop.** A human resolves;
+   that is the only manual case, and it is exactly the case that deserves eyes.
+4. Clean → `go build ./... && go vet ./...`, then assert each ledger row's test still
+   *exists* (a `-run` filter that matches nothing exits 0, so a silently dropped patch
+   must fail the sync) and run them: `-run 'TestReplica_Restore_Follow|LTXTimestamp'`.
+   Each patch has to prove it still does its job on the new base.
+5. Refresh `patches/`, push the branch, tag `$NEW-s3lite.1`, push the tag.
+6. `repository_dispatch` to s3lite.
+
+On the s3lite side, `.github/workflows/litestream-pin.yml` receives that dispatch (or
+runs manually), moves the `require` and the `replace` to the new base and tag, runs
+`go mod tidy`, and opens a PR. **The bot PR's CI is the verification** — `ci.yml`
+already runs the full test + integration suites on every PR — and a human merges when
+green. That also preserves the old doc's "moving the base is a pin change, re-verify"
+rule without anyone having to remember it.
+
+Two one-time setup notes for whoever wires the secrets:
+
+- GitHub fires `schedule` only from a repository's **default branch**, so the fork's
+  default branch must be `s3lite` for the weekly run to happen. Until then
+  `workflow_dispatch` and the manual commands below still work.
+- Cross-repo `repository_dispatch` and PR creation need a PAT (`GITHUB_TOKEN` is
+  repo-scoped): `S3LITE_DISPATCH_TOKEN` on the fork, and the pin workflow's PR
+  creation uses the repo's own `GITHUB_TOKEN` with `pull-requests: write`. Tag pushes
+  need `contents: write`. Without the PAT the sync still cuts the tag and just tells
+  you to bump the pin by hand.
+
+## Doing it by hand (the escape hatch)
 
 ```bash
 cd ~/dev/litestream
 git fetch upstream --tags
-# Replay the single fix commit onto the new upstream version (e.g. v0.5.16):
-git rebase --onto v0.5.16 <old-base> fix/follow-resume-ahead-of-snapshot
-git push --force-with-lease origin fix/follow-resume-ahead-of-snapshot   # PR branch
-git tag -a v0.5.16-s3lite.1 -m "v0.5.16 + follow-resume fix (for s3lite)"
+git rebase --onto v0.5.16 v0.5.15 s3lite       # replay the ledger onto the new base
+go build ./... && go vet ./...
+go test -count=1 -run 'TestReplica_Restore_Follow|LTXTimestamp' . ./s3 ./file
+rm -f patches/*.patch
+git format-patch v0.5.16..s3lite -o patches --no-signature -N --zero-commit \
+  -- . ':(exclude)patches'
+git commit -am 'chore(patches): refresh for base v0.5.16' || true
+git push --force-with-lease origin s3lite
+git tag -a v0.5.16-s3lite.1 -m 'litestream v0.5.16 + the s3lite patch ledger'
 git push origin v0.5.16-s3lite.1
 ```
 
@@ -64,32 +116,37 @@ Then bump s3lite:
 
 ```bash
 cd ~/dev/s3lite
-go get github.com/benbjohnson/litestream@v0.5.16           # move the base require
+go get github.com/benbjohnson/litestream@v0.5.16                     # move the base require
 go mod edit -replace=github.com/benbjohnson/litestream=github.com/atmin/litestream@v0.5.16-s3lite.1
 go mod tidy
-go build ./... && go vet ./... && go test -count=1 ./...
+gofmt -l . && go vet ./... && go test -race -count=1 ./... \
+  && go test -tags=integration -race -count=1 ./...
 ```
 
-Note: `git pull --rebase` on the fix branch rebases onto the fork's own copy of the
-branch, **not** upstream — always `git fetch upstream` + rebase onto the upstream tag.
+Note: `git pull --rebase` on a fork branch rebases onto the *fork's* copy, not
+upstream — always `git fetch upstream` and rebase onto the upstream tag.
 
-**Moving the base is a pin change:** re-verify anything that was validated against the
-old version. For the follower-refresh feature specifically, re-run the follow-mode
-probe (`go test -run TestReplica_Restore_Follow ./` in the fork) after the bump.
+## Dropping a patch
 
-## Exit workflow (when the upstream PR merges)
+When a row's fix ships in an upstream release, remove that commit from the `s3lite`
+branch, delete its ledger row, refresh `patches/`, and cut the next tag. Anything that
+depended on the patch has to lose its dependency note too:
 
-Once the fix ships in an upstream release, drop the fork entirely:
+- row 1 → the follower-refresh notes in `README.md` and `INVARIANTS.md` #6;
+- row 2 → the encryption notes in `README.md` and `INVARIANTS.md` #11, and the
+  `LTXTimestamper` comment in `encryptclient.go`.
+
+When the **last** row closes, drop the fork entirely:
 
 ```bash
 cd ~/dev/s3lite
 go mod edit -dropreplace=github.com/benbjohnson/litestream
-go get github.com/benbjohnson/litestream@<version-with-the-fix>
+go get github.com/benbjohnson/litestream@<version-with-everything>
 go mod tidy
-go build ./... && go vet ./... && go test -count=1 ./...
+gofmt -l . && go vet ./... && go test -race -count=1 ./...
 ```
 
 The `require` line was always present, so dropping the `replace` just falls back to
 upstream. Then remove the `replace`-pointer comment in `go.mod`, delete this file, and
-drop the fork-dependency note from `tasks/incremental-follower-refresh.md` /
-`INVARIANTS.md`. The fork repo/tags can be deleted at your leisure.
+drop the fork references from `README.md` and `INVARIANTS.md`. The fork repo and tags
+can go at your leisure.

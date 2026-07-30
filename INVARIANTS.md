@@ -296,6 +296,76 @@ across yields. Over a real lease and MinIO under the `integration` tag:
 `TestYieldHandoffS3` (yield over real conditional writes; a peer acquires immediately and
 round-trips data both directions).
 
+## 11. An encrypted replica's objects are ciphertext, and a wrong or absent key fails cleanly
+
+With `Config.EncryptionKey` set, every LTX object s3lite writes under `BackupTo` leaves
+the process already encrypted — on every path, because `newReplicaClient` is the only
+constructor of a replica client, so replication, restore, the follower's incremental
+advance, the latest-TXID probe and remote compaction all go through the same decorator.
+Nothing on the replica is plaintext, and reading it without the right key yields a
+**typed error, never data and never something that looks like a corrupt database**:
+`ErrKeyMismatch` for a wrong key, `ErrReplicaEncrypted` for a missing one,
+`ErrObjectNotEncrypted` for a plaintext object under `RequireEncrypted`.
+
+Three properties carry the weight:
+
+- **Sizes reported upward are plaintext sizes, by exact arithmetic.** litestream treats
+  a listed size as load-bearing — its `ResumableReader` compares it against its offset
+  to tell a premature EOF from a real one, and restore rejects an object smaller than an
+  LTX header — so the decorator converts every listed size rather than estimating.
+- **A read can start at an interior boundary.** Recovery from a dropped connection
+  reopens at an arbitrary *plaintext* offset, which is why the format is framed AEAD and
+  not a single seal, and why the resume path is tested through a real restore against a
+  client that cuts the body mid-object.
+- **Tampering is an error, not bytes.** Each frame authenticates over the object header,
+  its own index, and a final-frame flag, and its key is derived from the object's
+  identity (`level ‖ minTXID ‖ maxTXID`). So a flipped byte, a truncated or dropped
+  trailing frame, a reordered or duplicated frame, and a body moved between two object
+  names all fail. What a *streaming* AEAD promises is precisely this: a frame is
+  released only after it authenticates, so a tampered object yields at most an authentic
+  strict prefix and then an error — never modified bytes, never the whole object. That
+  is sufficient here because restore builds a temp file it renames only on success, so a
+  failed read leaves no partially-restored database.
+
+Encryption is opt-in and inert when unconfigured: with no key, no wrapper is installed
+at all and the bytes on the wire are what they were before the feature existed. What it
+does **not** hide is stated plainly in the README (object names, sizes, timestamps,
+`lock.json`, local files); the only lock-file change is that an encrypted instance with
+no explicit `Owner` publishes an opaque random id instead of a hostname. Key rotation is
+deliberately out of scope — the per-object salt means in-place rotation would be a full
+replica rewrite.
+
+*Enforced by:* the format itself — `TestEncryptSizeArithmetic` (every plaintext length
+across several frames, against really-sealed bytes),
+`TestEncryptRoundTrip`, `TestEncryptRangedReads`, `TestEncryptTamperIsAlwaysAnError`,
+`TestEncryptIdentityBinding`, `TestEncryptWrongKey`, `TestEncryptSaltIsPerObject`,
+`TestEncryptCiphertextRevealsNothing`, `TestParseEncHeader`. The decorator against a
+real backend — `TestEncryptedClientRoundTripFileBackend`,
+`TestEncryptedClientSingleFrameObject`, `TestEncryptedClientKeyCache`,
+`TestEncryptedClientRewrittenObjectSelfHeals`, `TestEncryptedClientMixedMode`,
+`TestEncryptedClientDelegates`, and — the resume proof, driven through litestream's own
+`ResumableReader` with a connection-dropping client —
+`TestEncryptedRestoreResumesThroughDroppedConnections`. End to end —
+`TestEncryptedReplicaRoundTrip`, `TestEncryptedReplicaSurvivesCompaction` (write,
+restore, compact, restore again), `TestEncryptedReplicaRetentionExpiresSuperseded`,
+`TestEncryptedReplicaKeyHandling` (wrong and absent keys both typed, neither leaving a
+partial database), `TestEncryptedReplicaMixedWindow`, `TestEncryptedFollowerRefresh` (a
+follower catches up encrypted, and one without the key fails cleanly),
+`TestEncryptedInstanceOwnerIsOpaque`, `TestEncryptedConfigValidation`. The opt-in proof
+is `TestUnencryptedReplicaInstallsNoWrapper` — plus the entire suite above running
+unchanged. Encryption does not disturb the lifecycle:
+`TestChaosSingleWriterDurabilityEncrypted` runs the whole chaos soak with a key set, so
+invariants 1, 2, 5 and 7 hold through encrypted handoffs, promote restores and the final
+restore. Over real object storage under the `integration` tag:
+`TestEncryptedReplicaRoundTripS3` (the bucket holds only ciphertext; the
+`litestream-timestamp` metadata the fork's second patch preserves is present and real;
+wrong and absent keys are typed) and `TestEncryptedLeaseHandoffS3` (two encrypted
+instances hand the writer role back and forth over one real lease, and `lock.json` stays
+plaintext but carries no hostname).
+
+(Encryption relies on the second patch in the litestream fork; see
+`LITESTREAM-FORK.md`.)
+
 ---
 
 ## The chaos soak
@@ -307,3 +377,7 @@ asserts at most one leader per settle and that no reader's view of durable rows
 regresses; at the end it restores a fresh instance and checks that every
 acked-and-synced row survived with the database intact. The seed is fixed and printed
 on failure so any failure reproduces.
+
+`TestChaosSingleWriterDurabilityEncrypted` runs the identical scenario with a
+`Config.EncryptionKey` set, so the same invariants are asserted while every read and
+write on every path goes through the encrypting client (#11).

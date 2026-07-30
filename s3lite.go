@@ -124,6 +124,37 @@ type Config struct {
 	// find nothing new do no swap.
 	FollowerRefreshInterval time.Duration
 
+	// EncryptionKey, when non-empty, encrypts every LTX object written under
+	// BackupTo with the caller's 32-byte key, so the bucket operator — or anyone
+	// who obtains read credentials — holds only ciphertext. Reads require the same
+	// key; a wrong or absent key is a clean typed error (ErrKeyMismatch,
+	// ErrReplicaEncrypted), never data and never a corrupt-looking database. Empty
+	// (the default) writes plaintext, byte-identical to a build without this
+	// feature: no wrapper is installed at all.
+	//
+	// What it does not hide: object names encode the compaction level and TXID
+	// range, object sizes are visible (so database size and write volume are),
+	// object timestamps are in the metadata litestream already writes, and
+	// lock.json stays plaintext — though with a key set an empty Owner defaults to
+	// an opaque random id instead of the hostname. Local state (LocalPath, the
+	// position directory, staging temp files) is out of scope and rests on the
+	// host's disk encryption. See the README's client-side-encryption section.
+	//
+	// Key rotation is deliberately not supported: s3lite is a single-key
+	// primitive. Each object is sealed under a key derived from its own random
+	// salt, so an in-place rotation would be a full rewrite of the replica. A
+	// consumer that wants cheap rotation should wrap its own data key above s3lite
+	// and keep the master here.
+	EncryptionKey []byte
+
+	// RequireEncrypted refuses to read a plaintext object from an encrypted
+	// replica. Leave it false while a previously-plaintext replica still holds
+	// pre-key objects — they keep restoring while retention ages them out. Set it
+	// once every live object is encrypted: that closes the downgrade path where
+	// anyone with bucket *write* access substitutes a crafted plaintext LTX file
+	// for an encrypted one. Requires EncryptionKey.
+	RequireEncrypted bool
+
 	// OnDemandPromotion, when true, makes a follower promote only via an explicit
 	// TryPromote (the consumer's write path) rather than greedily in the background. It
 	// exists to pair with YieldLease: a bare yield is self-defeating without it, since the
@@ -324,6 +355,22 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		strings.ToLower, "deferred", "immediate", "exclusive"); err != nil {
 		return nil, err
 	}
+	if err := validateEncryptionKey(cfg.EncryptionKey); err != nil {
+		return nil, err
+	}
+	if cfg.RequireEncrypted && len(cfg.EncryptionKey) == 0 {
+		return nil, errors.New("s3lite: RequireEncrypted needs an EncryptionKey")
+	}
+	// An encrypted replica should not publish machine names. lock.json is not on the
+	// replica-client path (it is litestream's own leaser) and stays plaintext, so fix
+	// the one thing in it that is not coordination state: default the owner to an
+	// opaque per-instance id rather than the hostname. Unencrypted consumers keep the
+	// diagnostic hostname they have today.
+	if len(cfg.EncryptionKey) > 0 && cfg.Owner == "" {
+		if cfg.Owner, err = opaqueOwnerID(); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := os.MkdirAll(filepath.Dir(cfg.LocalPath), 0o755); err != nil {
 		return nil, err
@@ -384,7 +431,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 	if restoreFrom != "" {
 		if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
-			if err := restoreDB(ctx, cfg.S3, restoreFrom, cfg.LocalPath); err != nil {
+			if err := restoreDB(ctx, cfg.replica(), restoreFrom, cfg.LocalPath); err != nil {
 				return nil, err
 			}
 		}
@@ -505,7 +552,7 @@ func precreateWAL(ctx context.Context, path string) error {
 // startReplicationLocked builds and opens the litestream store for the current
 // LocalPath. The caller must hold db.mu (or be in single-threaded Open).
 func (db *DB) startReplicationLocked(ctx context.Context) error {
-	client, err := newReplicaClient(db.cfg.S3, db.cfg.BackupTo)
+	client, err := newReplicaClient(db.cfg.replica(), db.cfg.BackupTo)
 	if err != nil {
 		return err
 	}
@@ -653,7 +700,7 @@ func (db *DB) CloseContext(ctx context.Context) error {
 	// a conservative restore on the next open, never a wrong resume, so it must not fail
 	// Close.
 	if db.leaser != nil && wasLeader && firstErr == nil {
-		if txid, err := replicaLatestTXIDFunc(ctx, db.cfg.S3, db.cfg.BackupTo); err != nil {
+		if txid, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo); err != nil {
 			db.logger.Warn("s3lite: recording clean-shutdown marker failed; next restart will restore", "error", err)
 		} else if err := writeCleanShutdown(db.cleanShutdownPath(), txid); err != nil {
 			db.logger.Warn("s3lite: writing clean-shutdown marker failed; next restart will restore", "error", err)

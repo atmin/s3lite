@@ -8,10 +8,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
 	github.com/benbjohnson/litestream v0.5.15
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/moby/moby/client v0.4.0
 	github.com/superfly/ltx v0.5.1
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
+	golang.org/x/crypto v0.52.0
 	modernc.org/sqlite v1.44.3
 )
 
@@ -56,7 +58,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hablullah/go-hijri v1.0.2 // indirect
 	github.com/hablullah/go-juliandays v1.0.0 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jalaali/go-jalaali v0.0.0-20210801064154-80525e88d958 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/lmittmann/tint v1.1.3 // indirect
@@ -99,7 +100,6 @@ require (
 	go.opentelemetry.io/otel v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/otel/trace v1.41.0 // indirect
-	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
@@ -111,7 +111,8 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-// Fork carrying the follow-mode resume-ahead-of-snapshot fix (needed by incremental
-// follower refresh). = upstream v0.5.15 + one commit. See LITESTREAM-FORK.md for the
-// sync/exit workflow; drop this once the fix lands upstream.
-replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.15-s3lite.1
+// Fork carrying two patches s3lite needs: the follow-mode resume-ahead-of-snapshot fix
+// (incremental follower refresh) and caller-supplied LTX timestamps on WriteLTXFile
+// (client-side encryption). = upstream v0.5.15 + the ledger. LITESTREAM-FORK.md is that
+// ledger, plus the automated sync that keeps this pin current.
+replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.15-s3lite.3

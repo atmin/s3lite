@@ -1,0 +1,125 @@
+# Open a PR moving the litestream pin to a freshly cut fork tag.
+#
+# The fork's sync-upstream workflow rebases the carried patches onto each new upstream
+# release, cuts an immutable tag, and repository_dispatches here. This workflow only
+# edits go.mod/go.sum and opens the PR — ci.yml's test + integration jobs run on that
+# PR, so the bot's CI *is* the verification, and a human merges when it is green. That
+# keeps the "moving the base is a pin change, re-verify" rule from LITESTREAM-FORK.md
+# without anyone having to remember it.
+name: litestream-pin
+
+on:
+  repository_dispatch:
+    types: [litestream-pin]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Upstream litestream release the fork now sits on (e.g. v0.5.16)"
+        required: true
+      tag:
+        description: "Fork tag to pin (e.g. v0.5.16-s3lite.1)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: litestream-pin
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve the requested pin
+        id: pin
+        env:
+          DISPATCH_BASE: ${{ github.event.client_payload.base }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          BASE="${DISPATCH_BASE:-$INPUT_BASE}"
+          TAG="${DISPATCH_TAG:-$INPUT_TAG}"
+          # The tag must encode the base it sits on — that invariant is what lets the
+          # fork's sync know where to rebase from, so refuse a pin that breaks it.
+          case "$BASE" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "base '$BASE' is not a release tag" >&2; exit 1 ;;
+          esac
+          case "$TAG" in
+            "$BASE"-s3lite.*) ;;
+            *) echo "tag '$TAG' does not sit on base '$BASE'" >&2; exit 1 ;;
+          esac
+          echo "base=$BASE" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+
+      - name: Move the pin
+        id: bump
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.pin.outputs.base }}"
+          TAG="${{ steps.pin.outputs.tag }}"
+          go get "github.com/benbjohnson/litestream@$BASE"
+          go mod edit "-replace=github.com/benbjohnson/litestream=github.com/atmin/litestream@$TAG"
+          go mod tidy
+          if git diff --quiet -- go.mod go.sum; then
+            echo "already pinned to $TAG; nothing to do."
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      # A build/vet gate here fails fast on an obviously broken pin; the PR's own CI
+      # (test + integration) is what actually qualifies it for merge.
+      - name: Smoke-check the new pin
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Open the PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE: ${{ steps.pin.outputs.base }}
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BRANCH="bot/litestream-pin-$TAG"
+          git config user.name "litestream-pin[bot]"
+          git config user.email "litestream-pin@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "chore(deps): pin litestream fork to $TAG (base $BASE)"
+          git push --force-with-lease origin "$BRANCH"
+
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            echo "PR already open for $BRANCH; the push updated it."
+            exit 0
+          fi
+          # Built line by line rather than with a heredoc: a heredoc body would have to
+          # sit at column 0, which is outside this YAML block scalar.
+          {
+            echo "The fork's \`sync-upstream\` workflow rebased the carried patch ledger onto"
+            echo "upstream \`$BASE\` and cut \`$TAG\`. This moves s3lite's \`require\` and"
+            echo "\`replace\` to it."
+            echo
+            echo "The fork's own sync already proved each carried patch still does its job on"
+            echo "the new base. **This PR's CI is the rest of the verification** — the test and"
+            echo "integration jobs run the full suites against the new pin. Merge when green."
+            echo
+            echo "See [LITESTREAM-FORK.md](https://github.com/$GITHUB_REPOSITORY/blob/master/LITESTREAM-FORK.md)"
+            echo "for the ledger of what the fork carries."
+          } >/tmp/pr-body.md
+          gh pr create \
+            --title "chore(deps): litestream fork → $TAG (base $BASE)" \
+            --body-file /tmp/pr-body.md

@@ -1253,7 +1253,7 @@ func TestFollowerRefreshErrorIsNonFatal(t *testing.T) {
 	installFakeLeaser(t, lock)
 
 	prev := replicaLatestTXIDFunc
-	replicaLatestTXIDFunc = func(context.Context, S3Config, string) (ltx.TXID, error) {
+	replicaLatestTXIDFunc = func(context.Context, replicaConfig, string) (ltx.TXID, error) {
 		return 0, errors.New("probe boom")
 	}
 	t.Cleanup(func() { replicaLatestTXIDFunc = prev })
@@ -1608,11 +1608,11 @@ func installRestoreFailSwitch(t *testing.T) *atomic.Bool {
 	t.Helper()
 	var fail atomic.Bool
 	prev := restoreDBFunc
-	restoreDBFunc = func(ctx context.Context, s3 S3Config, url, dest string) error {
+	restoreDBFunc = func(ctx context.Context, cfg replicaConfig, url, dest string) error {
 		if fail.Load() {
 			return errors.New("restore boom")
 		}
-		return prev(ctx, s3, url, dest)
+		return prev(ctx, cfg, url, dest)
 	}
 	t.Cleanup(func() { restoreDBFunc = prev })
 	return &fail
@@ -1627,11 +1627,11 @@ func installAdvanceFailSwitch(t *testing.T) *atomic.Bool {
 	t.Helper()
 	var fail atomic.Bool
 	prev := advanceFollowFileFunc
-	advanceFollowFileFunc = func(ctx context.Context, s3 S3Config, url, followPath string, target ltx.TXID) (ltx.TXID, error) {
+	advanceFollowFileFunc = func(ctx context.Context, cfg replicaConfig, url, followPath string, target ltx.TXID) (ltx.TXID, error) {
 		if fail.Load() {
 			return 0, errors.New("advance boom")
 		}
-		return prev(ctx, s3, url, followPath, target)
+		return prev(ctx, cfg, url, followPath, target)
 	}
 	t.Cleanup(func() { advanceFollowFileFunc = prev })
 	return &fail
@@ -2940,7 +2940,7 @@ func TestFollowerRefreshEqualsFullRestore(t *testing.T) {
 
 	// A fresh full restore of the same replica into a scratch path.
 	freshPath := filepath.Join(t.TempDir(), "fresh.sqlite3")
-	if err := restoreDB(ctx, S3Config{}, "file://"+replicaDir, freshPath); err != nil {
+	if err := restoreDB(ctx, replicaConfig{}, "file://"+replicaDir, freshPath); err != nil {
 		t.Fatalf("fresh full restore failed: %v", err)
 	}
 	fresh, err := sql.Open("sqlite", freshPath)
@@ -3006,9 +3006,9 @@ func installRestoreCounter(t *testing.T) *atomic.Int64 {
 	t.Helper()
 	var n atomic.Int64
 	prev := restoreDBFunc
-	restoreDBFunc = func(ctx context.Context, s3 S3Config, url, dest string) error {
+	restoreDBFunc = func(ctx context.Context, cfg replicaConfig, url, dest string) error {
 		n.Add(1)
-		return prev(ctx, s3, url, dest)
+		return prev(ctx, cfg, url, dest)
 	}
 	t.Cleanup(func() { restoreDBFunc = prev })
 	return &n
@@ -3053,7 +3053,7 @@ func captureLocalLTXTail(t *testing.T, ctx context.Context, db *DB, ns ...int) {
 func assertReplicaLineage(t *testing.T, ctx context.Context, replicaURL string) {
 	t.Helper()
 	verifyPath := filepath.Join(t.TempDir(), "verify.sqlite3")
-	if err := restoreDB(ctx, S3Config{}, replicaURL, verifyPath); err != nil { // raw restore, uncounted
+	if err := restoreDB(ctx, replicaConfig{}, replicaURL, verifyPath); err != nil { // raw restore, uncounted
 		t.Fatalf("verify restore: %v", err)
 	}
 	vdb, err := sql.Open("sqlite", verifyPath)
@@ -3216,7 +3216,7 @@ func TestPromoteSelfSuccessionKeepsLocalTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyPath := filepath.Join(t.TempDir(), "verify.sqlite3")
-	if err := restoreDB(ctx, S3Config{}, replicaDir, verifyPath); err != nil { // raw restore, uncounted
+	if err := restoreDB(ctx, replicaConfig{}, replicaDir, verifyPath); err != nil { // raw restore, uncounted
 		t.Fatalf("verify restore: %v", err)
 	}
 	vdb, err := sql.Open("sqlite", verifyPath)
@@ -3356,7 +3356,7 @@ func TestPromoteTakeoverClearsStaleLitestreamState(t *testing.T) {
 	if err := succ.Close(); err != nil {
 		t.Fatal(err)
 	}
-	replicaPos, err := replicaLatestTXIDFunc(ctx, S3Config{}, replicaDir)
+	replicaPos, err := replicaLatestTXIDFunc(ctx, replicaConfig{}, replicaDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3576,7 +3576,7 @@ func TestOpenDirectCrashSelfSuccessionResumesTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyPath := filepath.Join(t.TempDir(), "verify.sqlite3")
-	if err := restoreDB(ctx, S3Config{}, replicaDir, verifyPath); err != nil { // raw restore, uncounted
+	if err := restoreDB(ctx, replicaConfig{}, replicaDir, verifyPath); err != nil { // raw restore, uncounted
 		t.Fatalf("verify restore: %v", err)
 	}
 	vdb, err := sql.Open("sqlite", verifyPath)
@@ -3807,7 +3807,7 @@ func TestOpenDirectTakeoverClearsStaleLitestreamState(t *testing.T) {
 	if err := succ.Close(); err != nil {
 		t.Fatal(err)
 	}
-	replicaPos, err := replicaLatestTXIDFunc(ctx, S3Config{}, replicaDir)
+	replicaPos, err := replicaLatestTXIDFunc(ctx, replicaConfig{}, replicaDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3882,7 +3882,7 @@ func TestOpenDirectAmbiguousSignalRestores(t *testing.T) {
 
 	// Now blind the replica-position probe so the marker cannot be confirmed on reopen.
 	prevProbe := replicaLatestTXIDFunc
-	replicaLatestTXIDFunc = func(context.Context, S3Config, string) (ltx.TXID, error) {
+	replicaLatestTXIDFunc = func(context.Context, replicaConfig, string) (ltx.TXID, error) {
 		return 0, errors.New("probe boom")
 	}
 	t.Cleanup(func() { replicaLatestTXIDFunc = prevProbe })
@@ -3919,8 +3919,8 @@ func TestOpenDirectAmbiguousSignalRestores(t *testing.T) {
 // restoreAndCount does a fresh full restore of the replica into dest and returns the row
 // count of items. It takes no *testing.T so it is safe to call from a leaser hook running
 // on the lease-loop goroutine (t.Fatalf from a non-test goroutine is unsafe).
-func restoreAndCount(ctx context.Context, replicaURL, dest string) (int, error) {
-	if err := restoreDB(ctx, S3Config{}, replicaURL, dest); err != nil {
+func restoreAndCount(ctx context.Context, cfg replicaConfig, replicaURL, dest string) (int, error) {
+	if err := restoreDB(ctx, cfg, replicaURL, dest); err != nil {
 		return 0, err
 	}
 	vdb, err := sql.Open("sqlite", dest)
@@ -3938,7 +3938,7 @@ func restoreAndCount(ctx context.Context, replicaURL, dest string) (int, error) 
 func restoreNames(t *testing.T, ctx context.Context, replicaURL string) []string {
 	t.Helper()
 	dest := filepath.Join(t.TempDir(), "verify.sqlite3")
-	if err := restoreDB(ctx, S3Config{}, replicaURL, dest); err != nil {
+	if err := restoreDB(ctx, replicaConfig{}, replicaURL, dest); err != nil {
 		t.Fatalf("verify restore: %v", err)
 	}
 	vdb, err := sql.Open("sqlite", dest)
@@ -4011,7 +4011,7 @@ func TestYieldReleasesOnlyAfterReplicaCaughtUp(t *testing.T) {
 	var probeErr atomic.Value
 	db.leaser.(*fakeLeaser).onRelease = func() {
 		releaseAfterSync.Store(syncCompleted.Load())
-		if c, err := restoreAndCount(ctx, replicaDir, probePath); err != nil {
+		if c, err := restoreAndCount(ctx, replicaConfig{}, replicaDir, probePath); err != nil {
 			probeErr.Store(err)
 		} else {
 			releaseRows.Store(int64(c))

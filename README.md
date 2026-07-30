@@ -277,6 +277,91 @@ first-ever writer entry with no prior local file reads as restored, erring the s
 conservative direction as the fork guards. It is purely a signal: it changes no restore
 decision, only lets a consumer skip the reconciliation pass on a plain restart.
 
+## Client-side encryption (the bucket never sees plaintext)
+
+Set `Config.EncryptionKey` and every LTX object s3lite ships is encrypted **before it
+leaves the process**, under a key only your app holds. This is for a threat model that
+includes the bucket operator, or anyone who obtains read credentials — unlike SSE-C /
+SSE-KMS, which are server-side, so the provider decrypts on request.
+
+```go
+db, err := s3lite.Open(ctx, s3lite.Config{
+    LocalPath:     "/tmp/db.sqlite3",
+    BackupTo:      "s3://my-bucket/db",
+    S3:            s3cfg,
+    EncryptionKey: key, // exactly 32 bytes, from your secret manager — never in code
+})
+```
+
+Reads need the same key. A **wrong** key fails with `s3lite.ErrKeyMismatch` ("this
+bucket is not yours"), a **missing** one with `s3lite.ErrReplicaEncrypted` ("you forgot
+the key") — never data, and never something that looks like a corrupt database. Leave
+`EncryptionKey` empty (the default) and nothing changes: no wrapper is installed, and
+the objects are byte-identical to a build without this feature.
+
+### What is and is not hidden
+
+Encrypted: the contents of every LTX object — every page of your database and every
+WAL frame, including anything compaction rewrites.
+
+**Not** hidden, and you should decide whether that matters to you:
+
+- **Object names** encode the compaction level and TXID range.
+- **Object sizes** are visible, so database size and write volume are observable.
+- **Object timestamps** are in the metadata litestream already writes (they are what
+  timestamp-based restore and retention read back).
+- **`lock.json` stays plaintext.** It is the lease object, not a replica object — its
+  body is `{generation, expires_at, owner}`, pure coordination state with no
+  application data, and it is the one object an operator inspects by hand. What it
+  leaks is those three fields. Because litestream's default owner is derived from the
+  hostname, s3lite defaults `Owner` to an **opaque random per-instance id** when a key
+  is set, so an encrypted instance does not publish machine names. Set `Config.Owner`
+  explicitly to override; unencrypted consumers keep the diagnostic hostname.
+- **Local state** — `LocalPath`, the `.<name>-litestream/` position directory, staging
+  temp files — is out of scope. That rests on your host's disk encryption.
+
+### How it works, and what it costs
+
+Each object is `header | frames`: a 40-byte header (magic, version, frame-size code, a
+32-byte random salt) followed by 64 KiB plaintext frames sealed with
+ChaCha20-Poly1305. Overhead is a 16-byte tag per frame — **0.024%**.
+
+Framing rather than one seal per object is not a detail: litestream reopens a dropped
+stream mid-object at an arbitrary byte offset, so decryption has to be able to start at
+an interior boundary. Each frame's key is derived
+`HKDF-SHA256(EncryptionKey, salt, "s3lite-ltx-v1" ‖ level ‖ minTXID ‖ maxTXID)` — the
+identity binding is what stops anyone with bucket *write* access from moving a body
+between object names — and each frame is authenticated over its index and a
+final-frame flag, so a reordered, duplicated, or dropped frame is an error rather than
+a short read.
+
+The per-object random salt matters because the same object name can legitimately be
+rewritten with different bytes (a retried upload, a re-run compaction), which under an
+identity-derived nonce would be keystream reuse.
+
+### Key rotation is not supported — on purpose
+
+s3lite is a single-key primitive. Every object is sealed under a key derived from its
+own salt, so rotating in place would mean rewriting the whole replica. If you want
+cheap rotation, wrap your own data key above s3lite and keep the master key here.
+
+### Adopting it on an existing replica
+
+Turning the key on is safe on a replica that already holds plaintext objects: they are
+detected per object and pass through, so restores keep working while retention ages the
+plaintext out (the default snapshot retention is 24h — mind bucket versioning and
+soft-delete, which retain it regardless). Once every live object is encrypted, set
+`RequireEncrypted: true`. That closes the downgrade path where someone with bucket
+write access substitutes a crafted plaintext LTX file for an encrypted one, and it also
+makes the size bookkeeping exact — during the mixed window a pre-key object's reported
+size is under-reported by its would-be framing overhead, which slightly weakens
+litestream's premature-EOF *recovery* on that object (a truncated read then surfaces as
+a decode error instead of being retried; it is never silently short).
+
+> Encryption depends on the second patch in the litestream fork — the backend needs to
+> accept the LTX timestamp from the caller, because ciphertext cannot be peeked for an
+> LTX header. See [LITESTREAM-FORK.md](LITESTREAM-FORK.md).
+
 ## Configuration
 
 s3lite itself reads no environment variables. Pass S3 settings via `S3Config`.
@@ -313,6 +398,10 @@ blank and rely on the instance role.
   (it comes back as a follower and promotes) or had **already expired** (it re-acquires
   the lease directly at `Open`). A plain clean restart likewise resumes in place with no
   full re-download. See INVARIANTS.md #9.
+- Client-side encryption (`Config.EncryptionKey`) covers the replica objects only, and
+  is a single-key primitive — no rotation. Object names, sizes and timestamps stay
+  visible, `lock.json` stays plaintext, and local files rest on host disk encryption.
+  See [Client-side encryption](#client-side-encryption-the-bucket-never-sees-plaintext).
 
 ## Guarantees
 
