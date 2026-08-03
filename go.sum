@@ -26,8 +26,8 @@ github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERo
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.3.0 h1:wQlqotpyjYPjJz+Noh5bRu7Snmydk8SKC5Z6u1CR20Y=
 github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.3.0/go.mod h1:FTzydeQVmR24FI0D6XWUOMKckjXehM/jgMn1xC+DA9M=
-github.com/atmin/litestream v0.5.15-s3lite.3 h1:VDeSL8jSJUzZ/vLaiIChguYVdbiYz4rds/ilMbMeT7Y=
-github.com/atmin/litestream v0.5.15-s3lite.3/go.mod h1:ba9SBmcH/etkOlUf5OkZm2hJXzo1MAV3dqK2qmcJs+4=
+github.com/atmin/litestream v0.5.15-s3lite.5 h1:KoYr8YcMo2/42dO0XF7xZNlgp85ZqG92JMMY54Q+tjI=
+github.com/atmin/litestream v0.5.15-s3lite.5/go.mod h1:ba9SBmcH/etkOlUf5OkZm2hJXzo1MAV3dqK2qmcJs+4=
 github.com/aws/aws-sdk-go-v2 v1.41.5 h1:dj5kopbwUsVUVFgO4Fi5BIT3t4WyqIDjGKCangnV/yY=
 github.com/aws/aws-sdk-go-v2 v1.41.5/go.mod h1:mwsPRE8ceUUpiTgF7QmQIJ7lgsKUPQOUl3o72QBrE1o=
 github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.8 h1:eBMB84YGghSocM7PsjmmPffTa+1FBUeNvGvFou6V/4o=
