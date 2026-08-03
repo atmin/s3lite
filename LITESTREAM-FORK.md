@@ -25,12 +25,20 @@ none of which implement the interface, so they all keep the peek path.
 
 The branch also carries **fork infrastructure** commits, which are not ledger rows
 because they change no library behaviour and never need to go upstream: the sync
-workflow and `patches/` themselves, plus a one-line
+workflow itself, plus a one-line
 `if: github.repository == 'benbjohnson/litestream'` guard on upstream's tag- and
 schedule-triggered workflows. That guard exists because a `v*` tag push runs upstream's
 `release.yml`, which fails trying to publish a GitHub release to `benbjohnson/litestream`
 — noise on every tag the sync cuts, and plainly wrong if it ever succeeded. The fork
 publishes nothing but its own tags.
+
+The guard goes on **every job** of a guarded workflow: GitHub has no workflow-level
+`if` and `on: schedule` takes no condition. Guarding only the first job of
+`nightly-stability.yml` left its five soak jobs running on the fork, uploading ~25 GB
+of preserved soak temp dirs on 14-day retention and opening failure issues against the
+fork — which is also how we learned that upstream's `AssertNoSnapshotOnCheckpoint`
+predates its own `#1292` and now flags the intended TRUNCATE boundary snapshot
+(upstream fixed it in `#1396`; it arrives with the next release, nothing to carry).
 
 ## How it's wired
 
@@ -51,8 +59,12 @@ publishes nothing but its own tags.
   s3lite from any force-push to the fork; no submodule, no vendoring, no special CI.
 - The tag name encodes its own base (`v0.5.15-s3lite.3` sits on `v0.5.15`), which is
   why the sync automation below needs no state file to know what to rebase from.
-- `patches/` in the fork holds `git format-patch` output for the series, so a lost
-  branch is a `git am --3way` away.
+- **The tags are the series' recovery copy.** Every `*-s3lite.*` tag is immutable and
+  carries the whole series, so a lost or mis-pushed branch is one
+  `git branch -f s3lite <newest tag>` away. The fork used to keep a second copy as
+  `git format-patch` output in `patches/`; it duplicated what the tags already
+  guarantee, cost a refresh commit on every branch change, and had already drifted
+  stale — so it's gone.
 
 ### Other branches on the fork
 
@@ -74,7 +86,7 @@ publishes nothing but its own tags.
    *exists* (a `-run` filter that matches nothing exits 0, so a silently dropped patch
    must fail the sync) and run them: `-run 'TestReplica_Restore_Follow|LTXTimestamp'`.
    Each patch has to prove it still does its job on the new base.
-5. Refresh `patches/`, push the branch, tag `$NEW-s3lite.1`, push the tag.
+5. Push the branch, tag `$NEW-s3lite.1`, push the tag.
 6. `repository_dispatch` to s3lite.
 
 On the s3lite side, `.github/workflows/litestream-pin.yml` receives that dispatch (or
@@ -129,10 +141,6 @@ git fetch upstream --tags
 git rebase --onto v0.5.16 v0.5.15 s3lite       # replay the ledger onto the new base
 go build ./... && go vet ./...
 go test -count=1 -run 'TestReplica_Restore_Follow|LTXTimestamp' . ./s3 ./file
-rm -f patches/*.patch
-git format-patch v0.5.16..s3lite -o patches --no-signature -N --zero-commit \
-  -- . ':(exclude)patches'
-git commit -am 'chore(patches): refresh for base v0.5.16' || true
 git push --force-with-lease origin s3lite
 git tag -a v0.5.16-s3lite.1 -m 'litestream v0.5.16 + the s3lite patch ledger'
 git push origin v0.5.16-s3lite.1
@@ -155,7 +163,7 @@ upstream — always `git fetch upstream` and rebase onto the upstream tag.
 ## Dropping a patch
 
 When a row's fix ships in an upstream release, remove that commit from the `s3lite`
-branch, delete its ledger row, refresh `patches/`, and cut the next tag. Anything that
+branch, delete its ledger row, and cut the next tag. Anything that
 depended on the patch has to lose its dependency note too:
 
 - row 1 → the follower-refresh notes in `README.md` and `INVARIANTS.md` #6;
