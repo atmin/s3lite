@@ -74,9 +74,9 @@ filters.
   detection (progress not advancing ⇒ a hung range read). It needs a progress
   hook *inside* the vendored litestream `Restore` — `total` from the plan,
   `applied` from a counting reader wrapping each `ResumableReader` — i.e. a fork
-  change (see LITESTREAM-FORK.md). The need is unproven: a "restoring…" state
+  change (see docs/litestream-fork.md). The need is unproven: a "restoring…" state
   driven by the start/complete lines above covers the common case. Captured as
-  [../ideas/restore-progress-callback.md](../ideas/restore-progress-callback.md);
+  [ideas/restore-progress-callback.md](ideas/restore-progress-callback.md);
   promote it only if a consumer genuinely wants a progress bar rather than a phase.
 
 ## Verify

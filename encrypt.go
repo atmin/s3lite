@@ -255,7 +255,7 @@ func encPlaintextSize(ctSize int64, frameSize int) (int64, error) {
 // It implements litestream.LTXTimestamper, which is the whole reason the fork
 // carries its second patch: every backend otherwise peeks the LTX header out of
 // the upload stream to record the object's metadata timestamp, and ciphertext
-// cannot be peeked. See LITESTREAM-FORK.md.
+// cannot be peeked. See docs/litestream-fork.md.
 type sealingReader struct {
 	src       *bufio.Reader
 	aead      cipher.AEAD

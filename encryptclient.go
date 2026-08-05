@@ -81,7 +81,7 @@ func (c *encryptedClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo)
 // backend records the LTX header's timestamp as object metadata (timestamp-based
 // restore and retention read it back) and normally peeks it out of the upload
 // stream, which ciphertext cannot supply. That hook is the fork's second carried
-// patch — see LITESTREAM-FORK.md.
+// patch — see docs/litestream-fork.md.
 func (c *encryptedClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	sealer, err := newSealingReader(c.key, level, minTXID, maxTXID, r)
 	if err != nil {

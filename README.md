@@ -229,7 +229,7 @@ so a read that is in flight at the swap may see a rare, retryable error (the con
 is dropped and re-dialed); keep the interval modest and retry.
 
 > The incremental refresh depends on a small litestream fork (a follow-mode
-> resume fix); see [LITESTREAM-FORK.md](LITESTREAM-FORK.md).
+> resume fix); see [docs/litestream-fork.md](docs/litestream-fork.md).
 
 The embedded `*sql.DB` is **stable for the life of the instance** — it is created
 once and never reassigned, even across promote/demote. Take it once
@@ -360,7 +360,7 @@ a decode error instead of being retried; it is never silently short).
 
 > Encryption depends on the second patch in the litestream fork — the backend needs to
 > accept the LTX timestamp from the caller, because ciphertext cannot be peeked for an
-> LTX header. See [LITESTREAM-FORK.md](LITESTREAM-FORK.md).
+> LTX header. See [docs/litestream-fork.md](docs/litestream-fork.md).
 
 ## Configuration
 
@@ -409,3 +409,10 @@ The correctness guarantees — single writer per replica, fencing on demotion,
 durability, follower staleness bounds, handle stability — are written up in
 [INVARIANTS.md](INVARIANTS.md), each naming the test that fails if it breaks.
 Read it if you are deciding whether to trust s3lite with your data.
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) is the entry point for working on s3lite — the
+repo layout, the commit convention, and the gate every change passes. The suites
+are in [docs/testing.md](docs/testing.md); the litestream fork s3lite pins is a
+patch ledger in [docs/litestream-fork.md](docs/litestream-fork.md).

@@ -4,13 +4,13 @@ The default `go test ./...` suite uses `file://` replicas only and needs no
 external services.
 
 Both suites run in CI (test + integration) on every push to `master` and every
-pull request — see [.github/workflows/ci.yml](.github/workflows/ci.yml). They also
+pull request — see [.github/workflows/ci.yml](../.github/workflows/ci.yml). They also
 gate the bot PR that moves the litestream pin
-([.github/workflows/litestream-pin.yml](.github/workflows/litestream-pin.yml)); see
-[LITESTREAM-FORK.md](LITESTREAM-FORK.md).
+([.github/workflows/litestream-pin.yml](../.github/workflows/litestream-pin.yml)); see
+[litestream-fork.md](litestream-fork.md).
 
 There is no third suite and no extra tag: client-side encryption
-([INVARIANTS.md](INVARIANTS.md) #11) is covered in both. The default suite carries the
+([INVARIANTS.md](../INVARIANTS.md) #11) is covered in both. The default suite carries the
 object format, the decorator against a real `file://` backend, the resume path, and a
 whole chaos soak run with a key (`TestChaosSingleWriterDurabilityEncrypted`); the
 integration suite adds what only a real object store can show — that the bucket holds

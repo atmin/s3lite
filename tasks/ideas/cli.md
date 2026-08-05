@@ -46,7 +46,7 @@ Two decisions that shape it:
   a person loses their last statement. The crash tests already cover it; the CLI is
   where it gets seen.
 - **The refresh path is already shaped right for per-statement.** In
-  `refreshFollowerOnce` ([../lease.go:635](../lease.go#L635)) the S3 fetch+apply runs
+  `refreshFollowerOnce` ([lease.go:635](../../lease.go#L635)) the S3 fetch+apply runs
   *outside* the connector gate and only the local copy+rename runs under it, so a pull
   never blocks the read path for the duration of a network round trip. And an unchanged
   replica early-outs at `pos <= db.lastRefreshPos` with no advance and no swap.
@@ -55,13 +55,13 @@ Two decisions that shape it:
 
 - **No exported synchronous refresh exists.** `refreshFollowerOnce` is unexported and
   documented "called only from `leaseLoop`"; `Sync` is a no-op for a follower
-  ([../s3lite.go:894](../s3lite.go#L894)); `TryPromote` refreshes but also takes the
+  ([s3lite.go:894](../../s3lite.go#L894)); `TryPromote` refreshes but also takes the
   pen. Per-statement freshness needs a new public entry point — roughly
   `(*DB).Refresh(ctx) (bool, error)` — safe to call from an arbitrary goroutine and
   serialised against promotion on `promoteMu`. That is a real API addition to a
   correctness-critical path, not CLI plumbing, so it wants its own task.
 - **A per-statement tip probe costs ~10 LISTs.** `replicaLatestTXID`
-  ([../replica.go:208](../replica.go#L208)) loops levels 0 through
+  ([replica.go:208](../../replica.go#L208)) loops levels 0 through
   `litestream.SnapshotLevel` (= 9) calling `MaxLTXFileInfo` sequentially, building a
   throwaway client each call. So *every* statement pays ten sequential round trips
   before discovering nothing changed — order 200-300ms against real S3. Interactively
@@ -75,7 +75,7 @@ Two decisions that shape it:
   contract we chose for its simplicity has an exception before any code is written.
 - **Refresh must not fire inside an explicit transaction.** The publish bumps the
   connector generation and in-flight connections re-dial against the new state
-  ([../lease.go:661](../lease.go#L661)). A human typing `BEGIN;` … `COMMIT;` at the
+  ([lease.go:661](../../lease.go#L661)). A human typing `BEGIN;` … `COMMIT;` at the
   prompt must not have the file swapped underneath mid-transaction, so the REPL has to
   track transaction depth and suppress pulls between `BEGIN` and `COMMIT`/`ROLLBACK`
   — which means parsing enough SQL to know, or asking the driver. Neither is free.

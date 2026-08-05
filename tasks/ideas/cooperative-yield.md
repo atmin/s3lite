@@ -18,7 +18,7 @@ more object-store operations:
 
 1. **Signal.** An instance that wants to write sets a `want-write` marker — a small
    S3 object (or a field alongside `lock.json`) carrying a ticket / requester id.
-2. **Observe.** The holder's renew loop ([../lease.go](../lease.go) `tryRenew`,
+2. **Observe.** The holder's renew loop ([../lease.go](../../lease.go) `tryRenew`,
    which already ticks at `TTL/3`) checks the marker each renewal.
 3. **Yield.** If a waiter is present **and** the holder is past a `minHold` floor
    **and** it is at a transaction boundary, the holder finishes its current txn,

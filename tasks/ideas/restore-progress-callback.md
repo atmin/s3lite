@@ -6,7 +6,7 @@ A `Config.OnRestoreProgress func(applied, total int64)` callback, fired while a
 restore runs, so an embedding application can show a live percentage / ETA and
 detect a *stalled* restore (bytes not advancing ⇒ a hung range read). It
 complements the restore lifecycle logging
-([../tasks/restore-observability.md](../tasks/restore-observability.md)): the log
+([../restore-observability.md](../restore-observability.md)): the log
 lines say "restore started / finished in Dms"; this says "42%, still moving."
 
 Mechanism:
@@ -44,7 +44,7 @@ Mechanism:
   and to log the wait. No consumer has asked for a *percentage* rather than a
   *phase*.
 - **It's a fork change.** It touches the `atmin/litestream` fork
-  ([../LITESTREAM-FORK.md](../LITESTREAM-FORK.md)), not just s3lite — a heavier
+  ([docs/litestream-fork.md](../../docs/litestream-fork.md)), not just s3lite — a heavier
   maintenance and upstream-rebase surface than a logger line, worth taking on
   only for a concrete requirement.
 - **Payoff scales with database size**, which is consumer-specific: a
@@ -57,7 +57,7 @@ Mechanism:
 - **Settle the fork surface first:** keep the litestream hook minimal and
   optional (an `OnProgress func(applied, total int64)` on `RestoreOptions`, nil
   by default) so rebasing onto upstream stays clean; document it in
-  LITESTREAM-FORK.md.
+  docs/litestream-fork.md.
 - **Then s3lite:** a `Config.OnRestoreProgress` field, plumbed through
   `restoreDB` (which will already carry the logger from the observability task);
   fire it for both the initial-`Open` restore and the promote/open-direct

@@ -4,7 +4,7 @@
 # release, cuts an immutable tag, and repository_dispatches here. This workflow only
 # edits go.mod/go.sum and opens the PR — ci.yml's test + integration jobs run on that
 # PR, so the bot's CI *is* the verification, and a human merges when it is green. That
-# keeps the "moving the base is a pin change, re-verify" rule from LITESTREAM-FORK.md
+# keeps the "moving the base is a pin change, re-verify" rule from docs/litestream-fork.md
 # without anyone having to remember it.
 name: litestream-pin
 
@@ -134,7 +134,7 @@ jobs:
             echo "the new base. **This PR's CI is the rest of the verification** — the test and"
             echo "integration jobs run the full suites against the new pin. Merge when green."
             echo
-            echo "See [LITESTREAM-FORK.md](https://github.com/$GITHUB_REPOSITORY/blob/master/LITESTREAM-FORK.md)"
+            echo "See [docs/litestream-fork.md](https://github.com/$GITHUB_REPOSITORY/blob/master/docs/litestream-fork.md)"
             echo "for the ledger of what the fork carries."
           } >/tmp/pr-body.md
           gh pr create \

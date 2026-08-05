@@ -93,7 +93,7 @@ advance *fails* leaves the follower serving its current state: the advance runs 
 (and outside) the swap, and the publish copies into a temp before touching the live
 files, so a failure never destroys the live database. Promotion and `Open` remain full
 rebuilds by design. (The incremental path relies on a litestream fork; see
-`LITESTREAM-FORK.md`.)
+`docs/litestream-fork.md`.)
 
 *Enforced by:* `TestFollowerRefreshSeesNewWrites`, `TestFollowerRefreshIsIncremental`,
 `TestFollowerRefreshAdvanceFailureKeepsState`, `TestFollowerRefreshNoOpWhenUnchanged`,
@@ -364,7 +364,7 @@ instances hand the writer role back and forth over one real lease, and `lock.jso
 plaintext but carries no hostname).
 
 (Encryption relies on the second patch in the litestream fork; see
-`LITESTREAM-FORK.md`.)
+`docs/litestream-fork.md`.)
 
 ---
 
