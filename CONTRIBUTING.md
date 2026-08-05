@@ -63,7 +63,9 @@ A database wrapper that loses a commit is worse than no wrapper:
   with a key and without.
 - The **bucket format is the only compatibility surface.** Changing the
   encryption frame layout orphans every existing replica; corruption must
-  always surface as a typed error, never as bytes.
+  always surface as a typed error, never as bytes. The frame layout is pinned
+  against golden vectors ([docs/testing.md](docs/testing.md)) — a failing one
+  means the on-disk format changed, never a stale vector to update.
 
 Every change passes, in order — **format → vet → test**:
 

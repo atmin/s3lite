@@ -45,6 +45,14 @@ import (
 // authenticate instead of decrypting to a short read. Putting the header in the
 // AAD binds the version and frame-size code too (the salt is already bound
 // through the derivation).
+//
+// testdata/golden.json pins this format against committed vectors, because every
+// test above is symmetric (seals with the same code that opens), so a changed
+// derivation, header layout, or nonce/AAD composition would still pass them all —
+// a self-consistent format change orphans every existing replica with the suite
+// green. A failing vector means an on-disk format change: bump encVersion and
+// regenerate deliberately (see encrypt_golden_test.go); never edit the vector just
+// to make the test pass.
 
 const (
 	// encMagic marks an s3lite-encrypted object. It is compared against
@@ -109,10 +117,10 @@ func validateEncryptionKey(key []byte) error {
 	return fmt.Errorf("s3lite: EncryptionKey must be %d bytes, got %d", encKeySize, len(key))
 }
 
-// encObjectKey derives an object's frame key from the master key, the object's
-// random salt and its identity. See the package comment above for why identity is
-// part of the derivation.
-func encObjectKey(master, salt []byte, level int, minTXID, maxTXID ltx.TXID) (cipher.AEAD, error) {
+// encDeriveSubkey derives an object's raw frame-key bytes from the master key, the
+// object's random salt and its identity. Split out of encObjectKey so a golden-vector
+// test can assert the derived bytes directly instead of only through the AEAD they seed.
+func encDeriveSubkey(master, salt []byte, level int, minTXID, maxTXID ltx.TXID) ([]byte, error) {
 	info := make([]byte, 0, len(encKeyInfoPrefix)+4+8+8)
 	info = append(info, encKeyInfoPrefix...)
 	info = binary.BigEndian.AppendUint32(info, uint32(level))
@@ -122,6 +130,17 @@ func encObjectKey(master, salt []byte, level int, minTXID, maxTXID ltx.TXID) (ci
 	sub, err := hkdf.Key(sha256.New, master, salt, string(info), encKeySize)
 	if err != nil {
 		return nil, fmt.Errorf("s3lite: derive object key: %w", err)
+	}
+	return sub, nil
+}
+
+// encObjectKey derives an object's frame key from the master key, the object's
+// random salt and its identity. See the package comment above for why identity is
+// part of the derivation.
+func encObjectKey(master, salt []byte, level int, minTXID, maxTXID ltx.TXID) (cipher.AEAD, error) {
+	sub, err := encDeriveSubkey(master, salt, level, minTXID, maxTXID)
+	if err != nil {
+		return nil, err
 	}
 	aead, err := chacha20poly1305.New(sub)
 	if err != nil {
@@ -145,12 +164,19 @@ func newEncHeader(frameCode uint8) (*encHeader, error) {
 	if _, err := rand.Read(salt); err != nil {
 		return nil, fmt.Errorf("s3lite: generate object salt: %w", err)
 	}
+	return newEncHeaderWithSalt(frameCode, salt), nil
+}
+
+// newEncHeaderWithSalt builds a header from a caller-supplied salt. newEncHeader is
+// the rand.Read caller that delegates here; this exists so a golden-vector test can
+// pin the header layout under a fixed salt instead of a fresh random one every run.
+func newEncHeaderWithSalt(frameCode uint8, salt []byte) *encHeader {
 	raw := make([]byte, encHeaderSize)
 	copy(raw, encMagic)
 	raw[4] = encVersion
 	raw[5] = frameCode
 	copy(raw[8:], salt)
-	return &encHeader{frameSize: 1 << frameCode, salt: raw[8 : 8+encSaltSize], raw: raw}, nil
+	return &encHeader{frameSize: 1 << frameCode, salt: raw[8 : 8+encSaltSize], raw: raw}
 }
 
 // parseEncHeader reads a header off the front of an object. It returns

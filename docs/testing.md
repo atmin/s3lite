@@ -17,6 +17,17 @@ integration suite adds what only a real object store can show — that the bucke
 nothing but ciphertext, that the object metadata timestamp survives, and that two
 encrypted instances hand the lease back and forth.
 
+## Encryption golden vectors
+
+`testdata/golden.json` pins the encrypted object format (key derivation, header
+layout, and per-object framing) against fixed-salt vectors, independent of the
+round-trip tests that seal with the same code that opens. Regenerate only for a
+deliberate `encVersion` bump — never to make a failing vector pass:
+
+```bash
+S3LITE_GENERATE_GOLDEN=1 go test -run TestGenerateGoldenVectors
+```
+
 ## Benchmarks
 
 `BenchmarkSeal` / `BenchmarkOpen` cover the encryption streaming path. They exist to

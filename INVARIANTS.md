@@ -326,6 +326,12 @@ Three properties carry the weight:
   strict prefix and then an error — never modified bytes, never the whole object. That
   is sufficient here because restore builds a temp file it renames only on success, so a
   failed read leaves no partially-restored database.
+- **The frame layout itself is pinned against committed golden vectors, not just
+  round-tripped.** Every test above seals with the same code that opens, so a changed
+  derivation, header layout, or nonce/AAD composition would still pass them all — a
+  self-consistent format change orphans every existing replica with the suite green.
+  `testdata/golden.json` fixes the salt and asserts exact derivation, header, and
+  object-ciphertext bytes independent of round-tripping.
 
 Encryption is opt-in and inert when unconfigured: with no key, no wrapper is installed
 at all and the bytes on the wire are what they were before the feature existed. What it
@@ -339,7 +345,8 @@ replica rewrite.
 across several frames, against really-sealed bytes),
 `TestEncryptRoundTrip`, `TestEncryptRangedReads`, `TestEncryptTamperIsAlwaysAnError`,
 `TestEncryptIdentityBinding`, `TestEncryptWrongKey`, `TestEncryptSaltIsPerObject`,
-`TestEncryptCiphertextRevealsNothing`, `TestParseEncHeader`. The decorator against a
+`TestEncryptCiphertextRevealsNothing`, `TestParseEncHeader`, and — against fixed-salt
+golden vectors rather than a round-trip — `TestEncryptGoldenVectors`. The decorator against a
 real backend — `TestEncryptedClientRoundTripFileBackend`,
 `TestEncryptedClientSingleFrameObject`, `TestEncryptedClientKeyCache`,
 `TestEncryptedClientRewrittenObjectSelfHeals`, `TestEncryptedClientMixedMode`,
