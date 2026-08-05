@@ -4168,7 +4168,17 @@ func TestYieldBoundedByLeaseExpiry(t *testing.T) {
 	}
 
 	var demoted atomic.Bool
-	db.OnDemote(func(error) { demoted.Store(true) })
+	db.OnDemote(func(error) {
+		demoted.Store(true)
+		// Freeze the post-demote state for the assertions below. The abort-to-demote path
+		// sets eager (#10), so under OnDemandPromotion the loop still background-promotes
+		// on its next follower tick (TTL/3) — and this demote lands with the lease already
+		// expired, so that acquire succeeds immediately and legitimately un-fences the
+		// handle. Planting a foreign lease here is race-free: OnDemote fires synchronously
+		// on the leaseLoop goroutine inside doYield, so the lock is stolen before the loop
+		// can reach that tick.
+		lock.steal("thief", time.Minute)
+	})
 
 	prevSync := syncAndWaitFunc
 	syncAndWaitFunc = func(c context.Context, _ *litestream.DB) error { <-c.Done(); return c.Err() }
