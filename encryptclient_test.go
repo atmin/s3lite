@@ -742,7 +742,7 @@ func TestEncryptedReplicaSurvivesCompaction(t *testing.T) {
 
 	// A restore before compaction.
 	before := filepath.Join(t.TempDir(), "before.sqlite3")
-	if err := restoreDB(ctx, db.cfg.replica(), replicaURL, before, discardLogger()); err != nil {
+	if err := restoreDB(ctx, db.cfg.replica(), replicaURL, before, discardLogger(), nil); err != nil {
 		t.Fatalf("restore before compaction: %v", err)
 	}
 
@@ -760,7 +760,7 @@ func TestEncryptedReplicaSurvivesCompaction(t *testing.T) {
 
 	// And a restore after compaction sees the same rows.
 	after := filepath.Join(t.TempDir(), "after.sqlite3")
-	if err := restoreDB(ctx, db.cfg.replica(), replicaURL, after, discardLogger()); err != nil {
+	if err := restoreDB(ctx, db.cfg.replica(), replicaURL, after, discardLogger(), nil); err != nil {
 		t.Fatalf("restore after compaction: %v", err)
 	}
 	for _, path := range []string{before, after} {
@@ -879,7 +879,7 @@ func TestEncryptedReplicaKeyHandling(t *testing.T) {
 
 	t.Run("WrongKey", func(t *testing.T) {
 		dest := filepath.Join(t.TempDir(), "wrong.sqlite3")
-		err := restoreDB(ctx, replicaConfig{EncryptionKey: testKey(0xb4)}, replicaURL, dest, discardLogger())
+		err := restoreDB(ctx, replicaConfig{EncryptionKey: testKey(0xb4)}, replicaURL, dest, discardLogger(), nil)
 		if !errors.Is(err, ErrKeyMismatch) {
 			t.Fatalf("wrong key: got %v, want ErrKeyMismatch", err)
 		}
@@ -890,7 +890,7 @@ func TestEncryptedReplicaKeyHandling(t *testing.T) {
 
 	t.Run("AbsentKey", func(t *testing.T) {
 		dest := filepath.Join(t.TempDir(), "nokey.sqlite3")
-		err := restoreDB(ctx, replicaConfig{}, replicaURL, dest, discardLogger())
+		err := restoreDB(ctx, replicaConfig{}, replicaURL, dest, discardLogger(), nil)
 		if !errors.Is(err, ErrReplicaEncrypted) {
 			t.Fatalf("absent key: got %v, want ErrReplicaEncrypted", err)
 		}
@@ -911,7 +911,7 @@ func TestEncryptedReplicaKeyHandling(t *testing.T) {
 
 	t.Run("RightKeyStillWorks", func(t *testing.T) {
 		dest := filepath.Join(t.TempDir(), "right.sqlite3")
-		if err := restoreDB(ctx, replicaConfig{EncryptionKey: key}, replicaURL, dest, discardLogger()); err != nil {
+		if err := restoreDB(ctx, replicaConfig{EncryptionKey: key}, replicaURL, dest, discardLogger(), nil); err != nil {
 			t.Fatalf("restore with the right key: %v", err)
 		}
 	})
@@ -994,7 +994,7 @@ func TestEncryptedReplicaMixedWindow(t *testing.T) {
 
 	// With RequireEncrypted the pre-key objects are refused instead.
 	err = restoreDB(ctx, replicaConfig{EncryptionKey: key, RequireEncrypted: true}, replicaURL,
-		filepath.Join(t.TempDir(), "strict.sqlite3"), discardLogger())
+		filepath.Join(t.TempDir(), "strict.sqlite3"), discardLogger(), nil)
 	if !errors.Is(err, ErrObjectNotEncrypted) {
 		t.Fatalf("RequireEncrypted across the mixed window: got %v, want ErrObjectNotEncrypted", err)
 	}

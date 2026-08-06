@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -246,8 +247,9 @@ var restoreDBFunc = restoreDB
 // initial restore runs before the handle is returned, so an application blocking on
 // Open otherwise sees a hang indistinguishable from a stall. litestream's own
 // restore-plan log is Debug and s3lite gates litestream to WARN+ (logging.go), so
-// nothing else reports it.
-func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, logger *slog.Logger) error {
+// nothing else reports it. onProgress (Config.OnRestoreProgress) rides the same
+// seam for consumers that need the live byte count rather than the two events.
+func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, logger *slog.Logger, onProgress func(applied, total int64)) error {
 	client, err := newReplicaClient(cfg, rawURL)
 	if err != nil {
 		return err
@@ -255,6 +257,10 @@ func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, 
 	replica := litestream.NewReplicaWithClient(nil, client)
 	opt := litestream.NewRestoreOptions()
 	opt.OutputPath = destPath
+	progress := newRestoreProgressReporter(onProgress)
+	if progress != nil {
+		opt.OnProgress = progress.sample
+	}
 
 	logger.Info("s3lite: restoring from replica", "replica", rawURL, "path", destPath)
 	start := time.Now()
@@ -267,6 +273,7 @@ func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, 
 		}
 		return annotateEncryptionError(ctx, cfg, rawURL, fmt.Errorf("s3lite: restore: %w", err))
 	}
+	progress.finish()
 	// Size comes from the file we just wrote rather than from litestream's restore plan:
 	// the plan lives inside Restore and reporting it would mean recalculating it.
 	var size int64
@@ -276,6 +283,57 @@ func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, 
 	logger.Info("s3lite: restore complete", "replica", rawURL, "path", destPath,
 		"bytes", size, "elapsed", time.Since(start))
 	return nil
+}
+
+// restoreProgressReporter turns litestream's raw progress samples into the
+// contract Config.OnRestoreProgress documents: serialized, never regressing, and
+// ending a successful restore at (total, total). litestream fires from whichever
+// goroutine performed the read and its samples may arrive out of order, and both
+// consumers of this callback — a progress bar and a stall watchdog — would
+// otherwise have to absorb that separately. A nil callback yields a nil reporter,
+// so nothing is installed on the restore options at all.
+type restoreProgressReporter struct {
+	fn      func(applied, total int64)
+	mu      sync.Mutex
+	applied int64
+	total   int64
+}
+
+func newRestoreProgressReporter(fn func(applied, total int64)) *restoreProgressReporter {
+	if fn == nil {
+		return nil
+	}
+	return &restoreProgressReporter{fn: fn}
+}
+
+// sample forwards one litestream sample, dropping any that regresses — the sole
+// evidence of a stall is the count standing still, so a sample that went
+// backwards would read as progress undone rather than as no progress.
+func (p *restoreProgressReporter) sample(applied, total int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if applied < p.applied {
+		return
+	}
+	p.applied, p.total = applied, total
+	p.fn(applied, total)
+}
+
+// finish emits the (total, total) a completed restore ends on, so a bar always
+// lands at 100% rather than a hair short of it. A restore that fetched nothing
+// (an empty replica: Restore fails the plan before any sample) reported no
+// progress and gets no completion sample either.
+func (p *restoreProgressReporter) finish() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.total == 0 || p.applied >= p.total {
+		return
+	}
+	p.applied = p.total
+	p.fn(p.total, p.total)
 }
 
 // followCatchupInterval is both how often the managed Restore(Follow) loop polls the

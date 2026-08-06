@@ -11,10 +11,9 @@ Semantics are exactly today's, unchanged: reads always come from the local
 file, a writer streams WAL to the replica every second, `RoleWriter` fails to
 open when the lease is held. The CLI is packaging, not architecture — a REPL
 plus flag parsing over `Open`, the returned `*sql.DB`, and `Close`. It lands
-last on this frontier because it consumes the two tasks above it:
-[exported-refresh.md](exported-refresh.md) supplies the per-statement pull,
-[restore-progress-callback.md](restore-progress-callback.md) the cold-open
-progress bar.
+last on this frontier because it consumes what sits above it:
+[exported-refresh.md](exported-refresh.md) supplies the per-statement pull, and
+`Config.OnRestoreProgress` (landed) the cold-open progress bar.
 
 ## Why
 

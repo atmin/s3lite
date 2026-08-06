@@ -115,4 +115,4 @@ require (
 // (incremental follower refresh) and caller-supplied LTX timestamps on WriteLTXFile
 // (client-side encryption). = upstream v0.5.15 + the ledger. LITESTREAM-FORK.md is that
 // ledger, plus the automated sync that keeps this pin current.
-replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.16-s3lite.1
+replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.16-s3lite.2

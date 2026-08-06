@@ -64,13 +64,22 @@ Containers are still terminated via `t.Cleanup`, so there's no leak.
 
 ### Colima users
 
-Testcontainers looks for the Docker socket at `/var/run/docker.sock` and does not
-read the Docker CLI's context, so point it at Colima's socket explicitly:
+`make test-integration` handles this for you: when `~/.colima/default/docker.sock`
+exists and nothing is exported, the Makefile points testcontainers at it. Running
+`go test` directly needs both variables by hand:
 
 ```bash
 DOCKER_HOST=unix://$HOME/.colima/default/docker.sock \
-TESTCONTAINERS_RYUK_DISABLED=true go test -tags=integration ./...
+TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock \
+go test -tags=integration ./...
 ```
+
+Testcontainers looks for the socket at `/var/run/docker.sock` and does not read the
+Docker CLI's context, hence `DOCKER_HOST`. The override is a second, separate thing:
+it is the path Ryuk (the reaper container) bind-mounts *inside the VM*, and without
+it Ryuk tries to mount the host-side socket and dies with `mkdir
+/Users/…/docker.sock: operation not supported`. Disabling Ryuk works too, but there
+is no reason to give up the reaper.
 
 ## Manual smoke test against an existing S3
 

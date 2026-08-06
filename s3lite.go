@@ -73,6 +73,32 @@ type Config struct {
 	// logger is used. Set to slog.Default() to mirror the host application.
 	Logger *slog.Logger
 
+	// OnRestoreProgress, when non-nil, is called while a whole-database restore
+	// downloads, with the bytes fetched so far and the total the restore plan will
+	// fetch — LTX bytes on the replica, not the size of the restored database. It
+	// fires on every path that pulls the whole database down: Open's cold restore,
+	// the Open-direct fork guard, and a takeover promotion's rebuild. (A follower's
+	// incremental refresh applies deltas to a private follow file instead and
+	// reports nothing.) It is a Config field rather than a method because Open's
+	// restore runs before the handle exists, and that is the restore that matters
+	// most.
+	//
+	// It answers what the restore log lines cannot. A percentage for a human
+	// waiting on a cold multi-GB start — and, because a wedged range read freezes
+	// the byte count while a slow link keeps it moving, the difference between a
+	// stalled restore and a merely slow one, which no deadline can tell apart
+	// without also killing slow-but-healthy restores.
+	//
+	// The first call reports (0, total) as soon as the plan is known, applied never
+	// regresses, and the last call of a successful restore is (total, total). Calls
+	// are serialized, so the callback needs no locking of its own — but it runs
+	// inline with the download, once per read chunk, so it must be cheap: sample it,
+	// do not redraw or log per call. A restore with nothing to fetch (an empty
+	// replica) never calls it at all.
+	//
+	// Depends on the litestream fork — see docs/litestream-fork.md, row 4.
+	OnRestoreProgress func(applied, total int64)
+
 	// ShutdownSyncTimeout bounds the final durable flush performed by Close on a
 	// replicated DB. Close blocks up to this long waiting for the replica to
 	// catch up before it gives up (returning an error) rather than hanging on an
@@ -433,7 +459,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 	if restoreFrom != "" {
 		if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
-			if err := restoreDB(ctx, cfg.replica(), restoreFrom, cfg.LocalPath, db.logger); err != nil {
+			if err := restoreDB(ctx, cfg.replica(), restoreFrom, cfg.LocalPath, db.logger, cfg.OnRestoreProgress); err != nil {
 				return nil, err
 			}
 		}

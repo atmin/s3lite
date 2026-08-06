@@ -380,6 +380,11 @@ blank and rely on the instance role.
   restore complete"` with the elapsed time and restored size after — on every path that
   pulls the whole database down (the cold Open and a takeover promotion alike), so an app
   blocking on `Open` can surface a "restoring…" state rather than an unexplained pause.
+  For a live percentage rather than a phase, set `Config.OnRestoreProgress`: it reports
+  bytes fetched against the restore plan's total on those same paths, which is also what
+  tells a *stalled* restore (the count stops) from a slow one (it keeps moving) — a
+  distinction no deadline can draw without also killing slow-but-healthy restores. It
+  depends on the litestream fork; see [docs/litestream-fork.md](docs/litestream-fork.md).
 - Followers serve their Open-time snapshot and only refresh on promotion unless
   `FollowerRefreshInterval` is set, which gives bounded-staleness near-live reads by
   periodically applying only the LTX committed since the follower's position
