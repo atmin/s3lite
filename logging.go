@@ -10,8 +10,10 @@ import (
 // every sync interval (~1s), which is operational noise for an embedding
 // application. Holding litestream to WARN+ keeps that chatter out of the log
 // while still surfacing real replication problems (sync failures, retries).
-// s3lite's own lifecycle events (promote/demote/restore) are logged directly
-// through the application logger and are unaffected.
+// s3lite's own lifecycle events are logged directly through the application logger
+// and are unaffected: promote/demote/yield/refresh from lease.go, and the restore
+// operation itself — start and completion — from restoreDB (replica.go), which every
+// whole-database restore funnels through, including Open's initial cold restore.
 type minLevelHandler struct {
 	slog.Handler
 	min slog.Level

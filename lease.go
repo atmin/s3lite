@@ -761,7 +761,7 @@ func (db *DB) rebuildLocalFromReplica(ctx context.Context) error {
 	if err := removeLocalDBFiles(tmp); err != nil {
 		return fmt.Errorf("s3lite: rebuild: clear stale temp: %w", err)
 	}
-	if err := restoreDBFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, tmp); err != nil {
+	if err := restoreDBFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, tmp, db.logger); err != nil {
 		// Restore failed without touching the live files: keep serving current state.
 		return fmt.Errorf("s3lite: rebuild: restore: %w", err)
 	}
@@ -1051,7 +1051,7 @@ func (db *DB) restoreLocalFromReplica(ctx context.Context) error {
 	if err := removeLitestreamMeta(path); err != nil {
 		return fmt.Errorf("s3lite: open restore: clear litestream state: %w", err)
 	}
-	if err := restoreDBFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, path); err != nil {
+	if err := restoreDBFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, path, db.logger); err != nil {
 		return fmt.Errorf("s3lite: open restore: %w", err)
 	}
 	return precreateWAL(ctx, path)

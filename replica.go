@@ -234,7 +234,20 @@ func replicaLatestTXID(ctx context.Context, cfg replicaConfig, rawURL string) (l
 // restoreDB directly, so injecting here isolates the refresh/promote rebuild.
 var restoreDBFunc = restoreDB
 
-func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string) error {
+// restoreDB replaces destPath with the replica's latest committed state, logging the
+// operation on the application logger as a lifecycle event beside promote/demote.
+// All three paths that pull a whole database down funnel through here — Open's initial
+// cold restore, the promote rebuild, the Open-direct fork guard — so one pair of lines
+// covers them all. (A follower's incremental refresh advances its private follow file
+// instead and logs its own "follower refreshed".)
+//
+// The logging is not decoration: this is the one lifecycle step that can take seconds
+// to minutes (a large database pulled to a machine that has never seen it), and Open's
+// initial restore runs before the handle is returned, so an application blocking on
+// Open otherwise sees a hang indistinguishable from a stall. litestream's own
+// restore-plan log is Debug and s3lite gates litestream to WARN+ (logging.go), so
+// nothing else reports it.
+func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, logger *slog.Logger) error {
 	client, err := newReplicaClient(cfg, rawURL)
 	if err != nil {
 		return err
@@ -242,12 +255,26 @@ func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string) 
 	replica := litestream.NewReplicaWithClient(nil, client)
 	opt := litestream.NewRestoreOptions()
 	opt.OutputPath = destPath
+
+	logger.Info("s3lite: restoring from replica", "replica", rawURL, "path", destPath)
+	start := time.Now()
 	if err := replica.Restore(ctx, opt); err != nil {
 		if isEmptyReplica(err) {
+			// A fresh bucket: no output file is written and the caller carries on with a
+			// clean local database, so say so rather than claim a restore completed.
+			logger.Info("s3lite: replica is empty; nothing to restore", "replica", rawURL)
 			return nil
 		}
 		return annotateEncryptionError(ctx, cfg, rawURL, fmt.Errorf("s3lite: restore: %w", err))
 	}
+	// Size comes from the file we just wrote rather than from litestream's restore plan:
+	// the plan lives inside Restore and reporting it would mean recalculating it.
+	var size int64
+	if fi, statErr := os.Stat(destPath); statErr == nil {
+		size = fi.Size()
+	}
+	logger.Info("s3lite: restore complete", "replica", rawURL, "path", destPath,
+		"bytes", size, "elapsed", time.Since(start))
 	return nil
 }
 

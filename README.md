@@ -373,7 +373,13 @@ blank and rely on the instance role.
 
 - Single writer per replica. Enforce it yourself (one instance) or let s3lite
   enforce it with a lease — see [Single writer + read followers](#single-writer--read-followers-leasing).
-- Restore happens on Open — cold starts pay this cost, proportional to DB size (sub-second for small DBs, longer for multi-GB). Keep one instance warm if a large-DB restore would hurt first-request latency.
+- Restore happens on Open — cold starts pay this cost, proportional to DB size
+  (sub-second for small DBs, longer for multi-GB). Keep one instance warm if a large-DB
+  restore would hurt first-request latency. It is logged on `Config.Logger` as a
+  lifecycle event — `"s3lite: restoring from replica"` before it starts, `"s3lite:
+  restore complete"` with the elapsed time and restored size after — on every path that
+  pulls the whole database down (the cold Open and a takeover promotion alike), so an app
+  blocking on `Open` can surface a "restoring…" state rather than an unexplained pause.
 - Followers serve their Open-time snapshot and only refresh on promotion unless
   `FollowerRefreshInterval` is set, which gives bounded-staleness near-live reads by
   periodically applying only the LTX committed since the follower's position

@@ -65,7 +65,9 @@ type Config struct {
 	S3 S3Config
 
 	// Logger receives s3lite's own lifecycle events (promote/demote/restore) at
-	// their natural levels. litestream's internal logger is derived from this but
+	// their natural levels — including the start and completion of every restore,
+	// with its elapsed time, so the cold restore inside Open is observable rather
+	// than an unexplained pause. litestream's internal logger is derived from this but
 	// gated to WARN+, so its per-interval "replica sync" INFO chatter is dropped
 	// while real replication problems still surface. When nil, a WARN+ stderr
 	// logger is used. Set to slog.Default() to mirror the host application.
@@ -431,7 +433,7 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 	}
 	if restoreFrom != "" {
 		if _, err := os.Stat(cfg.LocalPath); os.IsNotExist(err) {
-			if err := restoreDB(ctx, cfg.replica(), restoreFrom, cfg.LocalPath); err != nil {
+			if err := restoreDB(ctx, cfg.replica(), restoreFrom, cfg.LocalPath, db.logger); err != nil {
 				return nil, err
 			}
 		}
