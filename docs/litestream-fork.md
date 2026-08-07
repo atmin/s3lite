@@ -20,6 +20,7 @@ One row per carried commit, in apply order. The fork lives while any row is open
 | 2   | caller-supplied LTX timestamp on `WriteLTXFile` | Every backend records the LTX header's timestamp as object metadata (timestamp-based restore and retention read it back) and obtains it by teeing the upload through `ltx.PeekHeader`. That makes "the body is a readable LTX stream" a hard requirement, so a caller that _transforms_ the bytes on the way out — s3lite's client-side encryption — cannot use `WriteLTXFile` at all. The patch adds an optional `litestream.LTXTimestamper` interface on the body: implement it and the backend takes the timestamp from the caller and uploads verbatim; otherwise it peeks exactly as before. Pins: `TestReplicaClient_WriteLTXFile_LTXTimestamp` in both `s3/` and `file/`. | **carried** — propose upstream as the generic body-transform seam (it is equally the hook compression would need)            |
 | 3   | the snapshot reader holds its own file handles | `DB.snapshotReader` streamed pages straight off `db.f`, from a goroutine that outlives the call that created it — a compaction upload, in practice. `DB.Close` nils `db.f`, so a snapshot still draining both raced `writeLTXFromDB` and died on `read database page N: invalid argument`. s3lite hits it on every short-lived database, because the L9 monitor's first tick is immediate (`time.NewTimer(time.Nanosecond)`), so `Store.Open` starts a full snapshot that a prompt `Close` overlaps — it took out `TestEncryptedReplicaRoundTripS3` in integration CI. The patch opens a private handle on the database, exactly as the reader already did for the WAL; consistency comes from `pos` holding `chkMu`, not from the handle. Pins: `TestDB_SnapshotReader_SurvivesDBClose`. | **carried** — propose upstream; still present on `main` as of 2026-08-03 (`#1346` made `SnapshotReader` closeable but left the shared handle) |
 | 4   | optional restore progress callback              | `Replica.Restore` reports only "done" or "failed", so a consumer blocked on a cold restore of a multi-GB database cannot tell *slow* from *stuck* and cannot draw a progress bar. The patch adds a nil-default `RestoreOptions.OnProgress func(applied, total int64)`: the plan's byte total fires once when the plan is computed, then a counting wrapper around each resumable reader reports the running total. Nil — every existing caller — allocates nothing and wraps no reader. Backs `s3lite.Config.OnRestoreProgress`. Pins: `TestReplica_Restore_OnProgress`. | **carried** — genuinely upstreamable; the CLI's `-progress` flag would be the upstream consumer |
+| 5   | `FsyncDir` is a no-op on Windows                | litestream fsyncs the directory it renamed a restored database into, and the POSIX way to do that — open the directory, `Sync` the handle — cannot work on Windows, where a directory handle is not open for writing. So **every restore on Windows fails at the last step**, `sync restore output dir: … Access is denied.`, after the download has already succeeded. Observed on Windows 11 26200 restoring a real drive; it is not a niche path, it is the only path a cold machine has. The patch moves `FsyncDir` into the package's existing `internal_unix.go`/`internal_windows.go` pair and makes the Windows arm return nil: NTFS journals the rename as a metadata transaction, and the ordering that matters (contents before the rename that publishes them) comes from fsyncing the *file*, which every caller already does. Pins: `TestFsyncDir`. | **carried** — upstream is broken here too, so this is the most straightforwardly upstreamable row; propose it                |
 
 Patch 2 is inert for every existing consumer: today's callers pass an `*os.File`
 (`replica.go`), an `io.PipeReader` (`compactor.go`) and the snapshot reader (`db.go`),
@@ -60,11 +61,11 @@ predates its own `#1292` and now flags the intended TRUNCATE boundary snapshot
 - s3lite `go.mod`:
 
   ```
-  require github.com/benbjohnson/litestream v0.5.15          // the base we track
-  replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.15-s3lite.6
+  require github.com/benbjohnson/litestream v0.5.16          // the base we track
+  replace github.com/benbjohnson/litestream => github.com/atmin/litestream v0.5.16-s3lite.3
   ```
 
-- The consumed ref is an **immutable tag** — `v0.5.15-s3lite.6` is upstream `v0.5.15`
+- The consumed ref is an **immutable tag** — `v0.5.16-s3lite.3` is upstream `v0.5.16`
   plus the ledger. A tag (not a branch) keeps `go.sum` reproducible and decouples
   s3lite from any force-push to the fork; no submodule, no vendoring, no special CI.
 - The tag name encodes its own base (`v0.5.15-s3lite.6` sits on `v0.5.15`), which is
@@ -150,7 +151,7 @@ cd ~/dev/litestream
 git fetch upstream --tags
 git rebase --onto v0.5.16 v0.5.15 s3lite       # replay the ledger onto the new base
 go build ./... && go vet ./...
-go test -count=1 -run 'TestReplica_Restore_Follow|TestReplica_Restore_OnProgress|LTXTimestamp|TestDB_SnapshotReader_SurvivesDBClose' . ./s3 ./file
+go test -count=1 -run 'TestReplica_Restore_Follow|TestReplica_Restore_OnProgress|LTXTimestamp|TestDB_SnapshotReader_SurvivesDBClose|TestFsyncDir' . ./s3 ./file ./internal
 git push --force-with-lease origin s3lite
 git tag -a v0.5.16-s3lite.1 -m 'litestream v0.5.16 + the s3lite patch ledger'
 git push origin v0.5.16-s3lite.1
