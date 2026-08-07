@@ -9,6 +9,13 @@ gate the bot PR that moves the litestream pin
 ([.github/workflows/litestream-pin.yml](../.github/workflows/litestream-pin.yml)); see
 [litestream-fork.md](litestream-fork.md).
 
+Both cover the shell (`cmd/s3lite`) too, on the same `./...`. Its cadence,
+transaction, lifecycle and dot-command rules are pinned in the default suite against
+a plain local SQLite file through an injected handle that counts refreshes,
+promotions and yields; the integration suite adds the two claims only a real object
+store can settle — a follower prompt seeing a peer's row on the next Enter, and an
+idle prompt handing the lease to a second `--role=writer` and taking it back.
+
 There is no third suite and no extra tag: client-side encryption
 ([INVARIANTS.md](../INVARIANTS.md) #11) is covered in both. The default suite carries the
 object format, the decorator against a real `file://` backend, the resume path, and a

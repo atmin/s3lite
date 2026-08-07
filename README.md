@@ -378,12 +378,59 @@ a decode error instead of being retried; it is never silently short).
 > accept the LTX timestamp from the caller, because ciphertext cannot be peeked for an
 > LTX header. See [docs/litestream-fork.md](docs/litestream-fork.md).
 
+## The `s3lite` shell
+
+```bash
+go install github.com/atmin/s3lite/cmd/s3lite@latest
+
+s3lite --role=writer   s3://my-bucket/db   # take the lease, stream the WAL
+s3lite --role=follower s3://my-bucket/db   # read-only, a fresh pull per statement
+```
+
+A prompt against your bucket, with the library's semantics unchanged: reads come
+from the local copy, a writer streams to the replica, and `--role=writer` fails to
+open while a peer holds the lease. It is packaging, not architecture — a REPL over
+`Open`, the returned `*sql.DB`, and `Close`. What it does that `sqlite3` cannot:
+
+- **Familiar, not compatible.** It implements the dot-commands people actually
+  type — `.tables` `.schema` `.mode` `.headers` `.dump` `.import` `.help` `.quit` —
+  and claims nothing beyond them. Scripts that need the real shell should keep
+  using `sqlite3` against the local file.
+- **Freshness per statement, once per pipe.** At a prompt, human think-time
+  dominates a pull, so every statement is preceded by a `Refresh`: what you read is
+  what the replica held when you pressed Enter. Piped input (`s3lite … <
+  script.sql`) is logically one read of one version — it pulls once, before the
+  first statement. Which contract applies is decided by whether stdin is a terminal.
+- **A transaction sees one snapshot.** Publishing new state swaps the file
+  underneath the session, so the pull is suppressed between `BEGIN` and
+  `COMMIT`/`ROLLBACK` and resumes on the first statement after. `.help` says so.
+- **The pen is held only while you write.** The session opens with
+  `OnDemandPromotion`, takes the lease on a statement, and `YieldLease`s it after
+  `--idle-yield` (30s) of silence at the prompt; the next statement takes it back.
+  A forgotten terminal does not pin the lease. `--role=follower` never takes it and
+  rejects writes, naming the flag that would not.
+- **Ctrl-C is [INVARIANTS.md](INVARIANTS.md) #4 made visible.** The first interrupt
+  cancels the statement in flight; one at an idle prompt exits through the same
+  durable, bounded `Close` a `SIGTERM`ed server gets, and reports what it flushed.
+- **A cold open shows progress.** `Config.OnRestoreProgress` drives a stderr bar on
+  a multi-GB first start, and the lifecycle log narrates promote/yield/restore.
+
+The local copy defaults to a stable path under your user cache directory keyed by
+the replica URL, so reopening the same URL resumes it rather than downloading it
+again (`--local` overrides). S3 settings come from `--endpoint`/`--region`/
+`--access-key-id`/`--secret-access-key`, falling back to the AWS variables below;
+`--key-file` supplies the client-side encryption key for an encrypted replica.
+`s3lite --help` is the full list.
+
 ## Configuration
 
-s3lite itself reads no environment variables. Pass S3 settings via `S3Config`.
-Empty fields fall through to the AWS SDK's default credential chain (env vars,
-`~/.aws/config`, IAM roles), so on EC2/ECS/Lambda you can leave credentials
-blank and rely on the instance role.
+The library itself reads no environment variables. Pass S3 settings via
+`S3Config`. Empty fields fall through to the AWS SDK's default credential chain
+(env vars, `~/.aws/config`, IAM roles), so on EC2/ECS/Lambda you can leave
+credentials blank and rely on the instance role. The `s3lite` shell above is the
+one part that reads the environment directly: its S3 flags fall back to
+`$AWS_ENDPOINT_URL`, `$AWS_REGION`, `$AWS_ACCESS_KEY_ID` and
+`$AWS_SECRET_ACCESS_KEY` before handing what is left to that same chain.
 
 ## Limitations
 

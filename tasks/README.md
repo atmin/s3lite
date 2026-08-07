@@ -7,7 +7,7 @@ are the record, so this list never becomes a changelog.
 
 The list is ordered — tasks land sequentially, top first.
 
-- [cli.md](cli.md) — the `sqlite3`-familiar shell: fresh pull per interactive statement, once per pipe, idle-yield writer lifecycle, restore progress bar on cold open
+*The frontier is empty: nothing is scheduled.*
 
 Candidates worth capturing but not committed to live in [ideas/](ideas/) —
 promote one up to this directory when it's ready to land.

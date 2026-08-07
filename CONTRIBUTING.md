@@ -26,6 +26,10 @@ INVARIANTS.md  The correctness contract — numbered claims, each pinned by a te
                encryption (encrypt.go + encryptclient.go, the ReplicaClient
                decorator), the generation-fenced database/sql connector
                (stableconn.go), logging (logging.go)
+cmd/s3lite/    The shell — the one binary. A REPL over Open, the returned
+               *sql.DB and Close: packaging, not architecture, so its contracts
+               (refresh cadence, transaction suppression, idle yield) live here
+               and never leak into the library
 docs/          testing.md — the suites, their gates, local Docker quirks.
                litestream-fork.md — the patch ledger and its weekly sync.
                notes/ — the evidence base: litestream/ltx source reading and
