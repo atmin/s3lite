@@ -56,10 +56,14 @@ writer role.
   *migrate between live instances* on demand. s3lite's model today is a sticky
   writer that hands off on death/deploy — for which trypromote already collapses
   the gap. Fairness among competing live writers is a use case we don't have.
-- **Handoff cost is the permanent tax.** Every yield pays a restore on the new
-  holder (until continuous follower refresh makes that cheap). Bursty-per-node
-  write patterns win; anything approaching per-write alternation loses to the
-  sticky model. Whether real workloads fall on the right side is unproven.
+- **Handoff cost is the permanent tax.** Continuous follower refresh has since
+  landed, but it does not pay this off: *promotion* remains a full rebuild by
+  design (INVARIANTS.md #6), so only the degenerate case is free — a yielded
+  holder re-promoting with no peer write in between resumes in place
+  (`TestYieldedRepromotesInPlace`). Genuine alternation restores
+  (`TestYieldPeerWroteRepromoteRestores`). Bursty-per-node write patterns win;
+  anything approaching per-write alternation still loses to the sticky model.
+  Whether real workloads fall on the right side is unproven.
 - **More moving parts on the correctness-critical path.** A `want-write` marker,
   ticketing, and the min/max hold state machine all interact with the fencing
   guarantees (`demote`, lease generation). It deserves its own careful safety
@@ -68,7 +72,11 @@ writer role.
 
 ## If we ever pick this up
 
-Prerequisites, in order: (1) continuous follower refresh (so handoff is cheap),
-(2) a concrete workload that wants the token to migrate between live instances.
-Only then design the marker format, ticketing, and the min/max hold policy — with a
-written fencing-safety argument up front.
+Prerequisites: (1) continuous follower refresh — **met**, shipped as
+`FollowerRefreshInterval` plus synchronous `Refresh`; (2) a concrete workload that
+wants the token to migrate between live instances — **still missing**, and it is
+the blocker. Note that (1) landing does *not* make handoff cheap on its own, per
+the tax above: making alternation viable would additionally mean promotion
+resuming from a follower's position instead of rebuilding. Only with a real
+workload in hand design the marker format, ticketing, and the min/max hold
+policy — with a written fencing-safety argument up front.
