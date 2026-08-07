@@ -332,9 +332,17 @@ type DB struct {
 
 	// lastRefreshPos is the replica TXID the follower last restored to. It gates
 	// no-op follower refreshes (skip the swap when the replica has not advanced).
-	// Accessed only from the leaseLoop goroutine (seeded at Open before the loop
-	// starts), so it needs no lock.
+	// Guarded by promoteMu — every refresh and promotion path already holds it across
+	// the whole rebuild, which is what lets the exported Refresh reach this off the
+	// leaseLoop goroutine. Seeded at Open, before the loop starts.
 	lastRefreshPos ltx.TXID
+
+	// probe is the replica client the latest-TXID probe reuses across calls (see
+	// probeClient): built on first use, never replaced, and separate from the writer's
+	// replication client. probeMu is its own lock because building it does network I/O
+	// (region lookup, credential resolution) and must not block mu.
+	probeMu sync.Mutex
+	probe   litestream.ReplicaClient
 
 	// promoteBackoff / promoteSkip throttle the background loop's promotion attempts
 	// after consecutive failures (e.g. a follower with a broken migration), so it does
@@ -728,7 +736,7 @@ func (db *DB) CloseContext(ctx context.Context) error {
 	// a conservative restore on the next open, never a wrong resume, so it must not fail
 	// Close.
 	if db.leaser != nil && wasLeader && firstErr == nil {
-		if txid, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo); err != nil {
+		if txid, err := db.latestReplicaTXID(ctx); err != nil {
 			db.logger.Warn("s3lite: recording clean-shutdown marker failed; next restart will restore", "error", err)
 		} else if err := writeCleanShutdown(db.cleanShutdownPath(), txid); err != nil {
 			db.logger.Warn("s3lite: writing clean-shutdown marker failed; next restart will restore", "error", err)
@@ -902,16 +910,40 @@ func (db *DB) OnDemote(fn func(error)) {
 }
 
 // OnRefresh registers a callback fired after a follower refresh swaps in newer
-// state from the replica (see Config.FollowerRefreshInterval), e.g. to bust caches
-// built on the previous snapshot. It never fires for a writer or when a tick finds
-// nothing new. It must not call Close — the callback runs on the lease-loop
-// goroutine and Close blocks waiting for that goroutine to exit, so calling Close
-// from here deadlocks — and it should return quickly. Set it before Open returns
-// control to other goroutines.
+// state from the replica (see Config.FollowerRefreshInterval and Refresh), e.g. to
+// bust caches built on the previous snapshot. It never fires for a writer or when a
+// refresh finds nothing new. It runs on whichever goroutine drove the refresh: the
+// internal lease loop for an interval tick, or the caller's for Refresh. It must not
+// call Close — Close blocks waiting for the lease-loop goroutine to exit, so calling
+// it from a callback that loop is running deadlocks — and it should return quickly.
+// Set it before Open returns control to other goroutines.
 func (db *DB) OnRefresh(fn func()) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.onRefresh = fn
+}
+
+// Refresh brings a follower up to the replica's latest committed state now, instead
+// of waiting for the next Config.FollowerRefreshInterval tick, and reports whether the
+// published state actually advanced. It is the synchronous "force freshness before
+// this read" entry point: an interactive consumer can call it per statement and a
+// request handler per request, paying the freshness cost only where it is needed.
+// FollowerRefreshInterval is the background cadence, not a prerequisite — Refresh
+// works with it unset.
+//
+// It never takes the writer pen: a follower stays a follower (TryPromote promotes).
+// It returns (false, nil) without any work on the writer — including an unleased sole
+// writer, which already holds the latest state — and on a probe that finds the replica
+// unchanged: no fetch, no swap, no OnRefresh. Every refresh that does advance fires
+// OnRefresh and does exactly what an interval tick does, incremental apply included.
+//
+// Safe from any goroutine and safe to call concurrently with itself, TryPromote and
+// the background loop: they serialise on one lock, so at most one rebuild runs at a
+// time and a promotion winning the race degrades this to the writer no-op. Bound ctx
+// to cap how long the fetch may take; a cancelled or failed Refresh leaves the
+// follower serving its current state. Once Close has begun it returns ErrClosed.
+func (db *DB) Refresh(ctx context.Context) (bool, error) {
+	return db.refreshFollowerOnce(ctx)
 }
 
 // Sync blocks until the replica is caught up with the current database state.

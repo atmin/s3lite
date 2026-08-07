@@ -95,12 +95,43 @@ files, so a failure never destroys the live database. Promotion and `Open` remai
 rebuilds by design. (The incremental path relies on a litestream fork; see
 `docs/litestream-fork.md`.)
 
+The same refresh is available **synchronously**: `(*DB).Refresh` publishes the replica's
+latest state now and reports whether anything advanced, so a consumer can force freshness
+immediately before a read rather than only on the interval (which it does not need set).
+It is the interval tick's own body called from the caller's goroutine, so every property
+above holds identically — and it never takes the pen: a follower stays a follower, and it
+is a no-op returning `(false, nil)` on a writer, on an unchanged replica, and for a
+promotion that wins the race for `promoteMu`.
+
+Its cost is part of the contract, because it is built to be called per statement. The
+"has the replica advanced?" probe reads **level 0 and the snapshot level only** — two
+listings, on a client each instance builds once and reuses rather than one constructed
+per call — and still reports exactly what a walk of all ten levels would. That holds
+because litestream admits data at only three places: level-0 uploads, compaction of
+level N-1 into level N, and a snapshot. Every compacted level's max therefore came from
+level 0's max at compaction time, and level 0's own max never goes backwards (both
+retention passes keep the newest file in a level), so level 0 dominates levels 1–8 at
+all times. The snapshot level is the exception that must still be read: it is stamped
+from the writer's *local* position, which can sit a sync ahead of the level-0 objects on
+the replica. The full walk survives as the fallback for the one state that argument does
+not cover — an empty level 0 with data above it, which litestream's own retention never
+produces but an external bucket lifecycle policy could.
+
 *Enforced by:* `TestFollowerRefreshSeesNewWrites`, `TestFollowerRefreshIsIncremental`,
 `TestFollowerRefreshAdvanceFailureKeepsState`, `TestFollowerRefreshNoOpWhenUnchanged`,
 `TestFollowerRefreshStaleTempFailureKeepsServing`,
 `TestFollowerRefreshReestablishesWhenFollowFileUnusable`,
 `TestFollowerRefreshEqualsFullRestore`, `TestFollowNeedsReestablish`,
-`TestPromoteRestoreFailureLeavesServingFollower`.
+`TestPromoteRestoreFailureLeavesServingFollower`. The synchronous entry point —
+`TestRefreshPullsOnDemand` (advance, no-op, read-only, `OnRefresh` exactly on advance,
+with no interval configured), `TestRefreshOnWriterIsNoOp`,
+`TestRefreshRacesPromotionAndLoop` (concurrent `Refresh` × `TryPromote` × interval tick
+under `-race`, through a promotion that genuinely wins), `TestRefreshAfterCloseIsClosed`.
+The probe — `TestReplicaLatestTXIDSeesEveryLevel` (a transaction compacted out of level 0
+is still seen, and a snapshot ahead of level 0 is too),
+`TestReplicaLatestTXIDListingBudget` (the two-listing budget, and the walk only when
+level 0 is empty), `TestProbeClientIsReusedAcrossProbes` and
+`TestProbeClientInitFailureIsNotCached`.
 
 ## 7. The stable `*sql.DB` is never reassigned
 

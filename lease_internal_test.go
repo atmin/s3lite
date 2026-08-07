@@ -1253,7 +1253,7 @@ func TestFollowerRefreshErrorIsNonFatal(t *testing.T) {
 	installFakeLeaser(t, lock)
 
 	prev := replicaLatestTXIDFunc
-	replicaLatestTXIDFunc = func(context.Context, replicaConfig, string) (ltx.TXID, error) {
+	replicaLatestTXIDFunc = func(context.Context, litestream.ReplicaClient) (ltx.TXID, error) {
 		return 0, errors.New("probe boom")
 	}
 	t.Cleanup(func() { replicaLatestTXIDFunc = prev })
@@ -2873,7 +2873,7 @@ func TestFollowerRefreshNoGoroutineLeak(t *testing.T) {
 	const rounds = 12
 	for i := 2; i <= rounds; i++ {
 		insert(fmt.Sprintf("v%d", i))
-		if err := db2.refreshFollowerOnce(ctx); err != nil {
+		if _, err := db2.refreshFollowerOnce(ctx); err != nil {
 			t.Fatalf("refresh %d failed: %v", i, err)
 		}
 	}
@@ -2888,7 +2888,7 @@ func TestFollowerRefreshNoGoroutineLeak(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	for i := 0; i < 3; i++ { // a few more ticks after the baseline
 		insert(fmt.Sprintf("x%d", i))
-		if err := db2.refreshFollowerOnce(ctx); err != nil {
+		if _, err := db2.refreshFollowerOnce(ctx); err != nil {
 			t.Fatalf("post-baseline refresh failed: %v", err)
 		}
 	}
@@ -2975,6 +2975,254 @@ func TestFollowerRefreshEqualsFullRestore(t *testing.T) {
 	}
 	if len(want) != total {
 		t.Fatalf("fresh restore has %d rows, want %d", len(want), total)
+	}
+}
+
+func TestRefreshPullsOnDemand(t *testing.T) {
+	// The exported synchronous pull: a follower with no background cadence at all
+	// (FollowerRefreshInterval unset) brings itself current when the consumer asks,
+	// reports that it advanced, and stays a read-only follower.
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+	insert("v1")
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	var refreshes atomic.Int64
+	db2.OnRefresh(func() { refreshes.Add(1) })
+
+	// Unchanged replica: no work, no callback, and the caller is told nothing moved.
+	if advanced, err := db2.Refresh(ctx); err != nil || advanced {
+		t.Fatalf("Refresh on an unchanged replica: got (%v, %v), want (false, nil)", advanced, err)
+	}
+
+	insert("v2")
+	advanced, err := db2.Refresh(ctx)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !advanced {
+		t.Fatal("Refresh must report true when it published newer state")
+	}
+	var n int
+	if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("after Refresh the follower sees %d rows, want 2", n)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("OnRefresh fired %d times, want exactly 1 (the advance)", got)
+	}
+
+	// Refresh never takes the pen, and the handle it publishes is still read-only.
+	if db2.IsLeader() {
+		t.Fatal("Refresh must not promote")
+	}
+	if _, err := cached.ExecContext(ctx, `INSERT INTO items (name) VALUES ('nope')`); err == nil {
+		t.Fatal("a refreshed follower handle must stay read-only")
+	}
+	if again, err := db2.Refresh(ctx); err != nil || again {
+		t.Fatalf("second Refresh at the same position: got (%v, %v), want (false, nil)", again, err)
+	}
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("a no-op Refresh must not fire OnRefresh; total %d", got)
+	}
+}
+
+func TestRefreshOnWriterIsNoOp(t *testing.T) {
+	// A writer already owns the latest state, so Refresh must not touch its files —
+	// for a leased leader and for an unleased sole writer alike.
+	ctx := context.Background()
+	installFakeLeaser(t, &fakeLock{})
+	leader, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   "file://" + t.TempDir(),
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	sole, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "sole.sqlite3"),
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sole.Close()
+
+	for name, db := range map[string]*DB{"leased leader": leader, "unleased sole writer": sole} {
+		advanced, err := db.Refresh(ctx)
+		if err != nil || advanced {
+			t.Fatalf("%s: Refresh got (%v, %v), want (false, nil)", name, advanced, err)
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO items (name) VALUES ('still writable')`); err != nil {
+			t.Fatalf("%s: writes must survive Refresh: %v", name, err)
+		}
+	}
+}
+
+func TestRefreshRacesPromotionAndLoop(t *testing.T) {
+	// Refresh is safe from any goroutine: concurrent Refresh, TryPromote and the
+	// background loop's own refresh tick serialise on promoteMu, so no rebuild is torn
+	// and a promotion winning mid-Refresh degrades Refresh to the writer no-op. Run
+	// under -race.
+	lock := &fakeLock{}
+	installFakeLeaser(t, lock)
+	ctx := context.Background()
+	replicaDir := "file://" + t.TempDir()
+
+	db1, err := Open(ctx, Config{
+		LocalPath:  filepath.Join(t.TempDir(), "leader.sqlite3"),
+		BackupTo:   replicaDir,
+		Role:       RoleWriter,
+		Owner:      "leader",
+		LeaseTTL:   time.Minute,
+		Migrations: []string{itemsSchema},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	insert := func(name string) {
+		t.Helper()
+		if _, err := db1.ExecContext(ctx, `INSERT INTO items (name) VALUES (?)`, name); err != nil {
+			t.Fatal(err)
+		}
+		if err := db1.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("v1")
+
+	db2, err := Open(ctx, Config{
+		LocalPath:               filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:                replicaDir,
+		Role:                    RoleFollower,
+		Owner:                   "follower",
+		LeaseTTL:                200 * time.Millisecond,
+		FollowerRefreshInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	cached := db2.DB
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	spin := func(fn func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if err := fn(); err != nil && !errors.Is(err, ErrClosed) {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		spin(func() error {
+			advanced, err := db2.Refresh(ctx)
+			if err != nil {
+				return fmt.Errorf("Refresh: %w", err)
+			}
+			if advanced && db2.IsLeader() {
+				// Only the no-op arm may run once we hold the pen — a writer must never
+				// have replica state published over its own.
+				return errors.New("Refresh advanced a writer's files")
+			}
+			return nil
+		})
+	}
+	spin(func() error { // a reader, to catch a torn swap
+		var n int
+		_ = cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n)
+		return nil
+	})
+	spin(func() error {
+		_, err := db2.TryPromote(ctx)
+		return err
+	})
+
+	// Phase 1: the leader holds the pen, so every TryPromote no-ops and the refreshes
+	// race the loop's own ticks for the writes landing on the replica.
+	for i := 2; i <= 6; i++ {
+		insert(fmt.Sprintf("v%d", i))
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Phase 2: free the lock mid-flight so a TryPromote genuinely wins while Refresh
+	// calls are in progress, and let the winner settle.
+	lock.expire()
+	waitFor(t, 5*time.Second, db2.IsLeader, "a racing TryPromote to win the lease")
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Whatever the race settled on, the database is intact and holds every write.
+	var integ string
+	if err := cached.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integ); err != nil {
+		t.Fatalf("integrity_check failed after the race: %v", err)
+	}
+	if integ != "ok" {
+		t.Fatalf("integrity_check = %q, want \"ok\"", integ)
+	}
+	var n int
+	if err := cached.QueryRowContext(ctx, `SELECT count(*) FROM items`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 6 {
+		t.Fatalf("promoted instance sees %d rows, want 6", n)
+	}
+}
+
+func TestRefreshAfterCloseIsClosed(t *testing.T) {
+	// Refresh rebuilds local files, so it must refuse once teardown has begun —
+	// the same contract TryPromote states.
+	ctx := context.Background()
+	replicaDir, insert := startIncrementalLeader(t)
+	insert("v1")
+
+	db2, err := Open(ctx, Config{
+		LocalPath: filepath.Join(t.TempDir(), "follower.sqlite3"),
+		BackupTo:  "file://" + replicaDir,
+		Role:      RoleFollower,
+		Owner:     "follower",
+		LeaseTTL:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db2.Refresh(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Refresh after Close: got %v, want ErrClosed", err)
 	}
 }
 
@@ -3356,7 +3604,7 @@ func TestPromoteTakeoverClearsStaleLitestreamState(t *testing.T) {
 	if err := succ.Close(); err != nil {
 		t.Fatal(err)
 	}
-	replicaPos, err := replicaLatestTXIDFunc(ctx, replicaConfig{}, replicaDir)
+	replicaPos, err := probeReplicaTXID(ctx, replicaDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3807,7 +4055,7 @@ func TestOpenDirectTakeoverClearsStaleLitestreamState(t *testing.T) {
 	if err := succ.Close(); err != nil {
 		t.Fatal(err)
 	}
-	replicaPos, err := replicaLatestTXIDFunc(ctx, replicaConfig{}, replicaDir)
+	replicaPos, err := probeReplicaTXID(ctx, replicaDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3882,7 +4130,7 @@ func TestOpenDirectAmbiguousSignalRestores(t *testing.T) {
 
 	// Now blind the replica-position probe so the marker cannot be confirmed on reopen.
 	prevProbe := replicaLatestTXIDFunc
-	replicaLatestTXIDFunc = func(context.Context, replicaConfig, string) (ltx.TXID, error) {
+	replicaLatestTXIDFunc = func(context.Context, litestream.ReplicaClient) (ltx.TXID, error) {
 		return 0, errors.New("probe boom")
 	}
 	t.Cleanup(func() { replicaLatestTXIDFunc = prevProbe })

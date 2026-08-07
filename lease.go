@@ -244,7 +244,7 @@ func (db *DB) leaseLoop(ctx context.Context) {
 				db.followerTick(ctx)
 			}
 		case <-refreshC:
-			if err := db.refreshFollowerOnce(ctx); err != nil && ctx.Err() == nil {
+			if _, err := db.refreshFollowerOnce(ctx); err != nil && ctx.Err() == nil {
 				db.logger.Warn("s3lite: follower refresh failed", "error", err)
 			}
 		case req := <-db.yieldC:
@@ -391,7 +391,7 @@ func (db *DB) doYield(ctx context.Context) error {
 	// costs a re-promote/restart a conservative restore, never a wrong resume. The same
 	// probe seeds lastRefreshPos so the first follower-refresh tick is a no-op unless a
 	// successor writes.
-	syncedTXID, probeErr := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
+	syncedTXID, probeErr := db.latestReplicaTXID(ctx)
 	if probeErr != nil {
 		db.logger.Warn("s3lite: yield: reading synced replica position failed; a restart/re-promote will restore", "error", probeErr)
 		syncedTXID = 0
@@ -603,16 +603,17 @@ func (db *DB) isClosing() bool {
 	return db.closed
 }
 
-// seedRefreshPos records the replica position a follower restored to at Open, so
-// the first refresh tick is a no-op unless the replica has since advanced. Called
-// once during Open (before the loop starts) when follower refresh is enabled;
-// best-effort — a probe failure just means the first tick does one redundant
-// restore.
+// seedRefreshPos records the replica position a follower restored to at Open, so the
+// first refresh is a no-op unless the replica has since advanced. Called once during
+// Open (before the loop starts) for every leased follower, not only those with a
+// FollowerRefreshInterval: Refresh is a synchronous pull with no cadence behind it, and
+// an unseeded position would make its first call re-fetch what Open just restored.
+// Best-effort — a probe failure just means that first refresh is redundant.
 func (db *DB) seedRefreshPos(ctx context.Context) {
-	if db.cfg.FollowerRefreshInterval <= 0 || db.leaser == nil {
+	if db.leaser == nil {
 		return
 	}
-	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
+	pos, err := db.latestReplicaTXID(ctx)
 	if err != nil {
 		db.logger.Warn("s3lite: seeding follower refresh position failed; first refresh may be redundant", "error", err)
 		return
@@ -621,10 +622,18 @@ func (db *DB) seedRefreshPos(ctx context.Context) {
 }
 
 // refreshFollowerOnce brings a follower up to the replica's latest committed state
-// and swaps it in read-only, so the follower serves near-live reads. It is a no-op on
-// the writer and when the replica has not advanced since the last refresh. It shares
-// promoteMu with promotion so a refresh and a promote can never both rebuild the local
-// file at once. Called only from leaseLoop.
+// and swaps it in read-only, so the follower serves near-live reads. It reports
+// whether the published state actually advanced. It is a no-op on the writer and when
+// the replica has not advanced since the last refresh. It shares promoteMu with
+// promotion so a refresh and a promote can never both rebuild the local file at once.
+//
+// It is the shared body of the leaseLoop's refresh tick and the public Refresh, so
+// both paths behave identically down to the logging — which is why it is written to be
+// callable from any goroutine rather than relying on loop confinement. Two things
+// carried that reliance and now stand on their own: db.lastRefreshPos is documented
+// promoteMu-guarded (this function and doYield, its only other writer, both hold it),
+// and the closing check below stands in for the loop's own teardown ordering, so a
+// caller racing Close cannot rebuild files under an instance that is tearing down.
 //
 // The refresh is incremental: it advances a private follow file by applying only the
 // LTX committed since the follower's position (litestream's own Restore(Follow)
@@ -632,22 +641,25 @@ func (db *DB) seedRefreshPos(ctx context.Context) {
 // into the live read path. The advance runs outside the connector gate — readers keep
 // serving the current snapshot during the S3 fetch+apply — and only the fast local
 // copy+rename runs under the gate. Promote and Open remain full rebuilds by design.
-func (db *DB) refreshFollowerOnce(ctx context.Context) error {
+func (db *DB) refreshFollowerOnce(ctx context.Context) (bool, error) {
 	if db.IsLeader() { // writers own the latest state; never self-refresh
-		return nil
+		return false, nil
 	}
 	db.promoteMu.Lock()
 	defer db.promoteMu.Unlock()
 	if db.IsLeader() { // recheck: a concurrent promote may have won
-		return nil
+		return false, nil
+	}
+	if db.isClosing() { // do not rebuild files under an instance that is shutting down
+		return false, ErrClosed
 	}
 
-	pos, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
+	pos, err := db.latestReplicaTXID(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if pos <= db.lastRefreshPos {
-		return nil // replica unchanged since our last refresh — no advance, no swap
+		return false, nil // replica unchanged since our last refresh — no advance, no swap
 	}
 
 	// Advance the private follow file (no SQLite reader opens it) to the replica's
@@ -655,7 +667,7 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 	// untouched — the follower keeps serving its current state — so we just return.
 	reached, err := advanceFollowFileFunc(ctx, db.cfg.replica(), db.cfg.BackupTo, db.followPath(), pos)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	swapErr := db.connector.swapFiles(true, func() error { // stays read-only
@@ -665,7 +677,7 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 		// The publish is atomic: on failure the live files are untouched, so the
 		// follower keeps serving its current state — the swap only bumped the
 		// generation, so in-flight connections re-dial against that same state.
-		return swapErr
+		return false, swapErr
 	}
 	db.lastRefreshPos = reached
 
@@ -676,7 +688,7 @@ func (db *DB) refreshFollowerOnce(ctx context.Context) error {
 	if onRefresh != nil {
 		onRefresh()
 	}
-	return nil
+	return true, nil
 }
 
 // promote turns a follower into the writer: it restores the replica's latest
@@ -959,7 +971,7 @@ func (db *DB) cleanMarkerResumeOK(ctx context.Context) bool {
 	if !ok {
 		return false
 	}
-	latest, err := replicaLatestTXIDFunc(ctx, db.cfg.replica(), db.cfg.BackupTo)
+	latest, err := db.latestReplicaTXID(ctx)
 	switch {
 	case err != nil:
 		db.logger.Warn("s3lite: will restore; clean-shutdown replica probe failed", "error", err)

@@ -197,35 +197,117 @@ func probeEncryptionCauseForObject(ctx context.Context, cfg replicaConfig, clien
 
 // replicaLatestTXIDFunc is the "latest replica position" probe used by follower
 // refresh. It is a package var so tests can inject failures/positions without a
-// real backend; in production it is always replicaLatestTXID.
+// real backend; in production it is always replicaLatestTXID. Callers reach it
+// through (*DB).latestReplicaTXID, which supplies the shared probe client.
 var replicaLatestTXIDFunc = replicaLatestTXID
 
-// replicaLatestTXID returns the highest transaction id present on the replica
-// across all levels, or 0 if the replica is empty. It is the "has anything new
-// been committed since I last restored?" probe the follower refresh uses to skip
-// no-op restores. It builds a throwaway client each call (like restoreDB), so it
-// never shares state with a live writer's replication. It lists every level so a
-// transaction that has been compacted upward (out of level 0) is still seen.
-func replicaLatestTXID(ctx context.Context, cfg replicaConfig, rawURL string) (ltx.TXID, error) {
-	client, err := newReplicaClient(cfg, rawURL)
+// replicaLatestTXID returns the highest transaction id present on the replica, or 0
+// if the replica is empty. It is the "has anything new been committed since I last
+// refreshed?" probe behind follower refresh and (*DB).Refresh, and it is called often
+// enough — once per follower tick, and once per statement by an interactive consumer
+// forcing freshness — that its cost is part of its contract: two listings on a client
+// the caller reuses.
+//
+// It reads only level 0 and the snapshot level, because those are the only two levels
+// data can enter at. litestream has exactly three producers: level-0 uploads of what
+// the writer committed, compaction of level N-1 into level N, and a snapshot written
+// at SnapshotLevel. So every intermediate level's max came from level 0's max at
+// compaction time, and level 0's own max never goes backwards — both retention passes
+// keep the newest file in a level (EnforceL0RetentionByTime, EnforceRetentionByTXID)
+// — which makes level 0 dominate levels 1..8 at all times. The snapshot level is the
+// exception that must still be read: it is stamped from the writer's *local* position
+// (db.Pos()), which can sit a sync interval ahead of the level-0 objects actually on
+// the replica, so a writer dying in that window leaves a snapshot no level-0 object
+// accounts for.
+//
+// The full walk survives for the one state that argument does not cover: an empty
+// level 0 with data above it. litestream's own retention never produces it, but an
+// external bucket lifecycle policy could — so the cheap probe is never less than the
+// walk it replaced, at the cost of the extra listings only when level 0 is empty.
+func replicaLatestTXID(ctx context.Context, client litestream.ReplicaClient) (ltx.TXID, error) {
+	l0, err := maxTXIDAtLevel(ctx, client, 0)
 	if err != nil {
 		return 0, err
 	}
-	if err := client.Init(ctx); err != nil {
+	maxTXID, err := maxTXIDAtLevel(ctx, client, litestream.SnapshotLevel)
+	if err != nil {
 		return 0, err
 	}
-	replica := litestream.NewReplicaWithClient(nil, client)
-	var maxTXID ltx.TXID
-	for level := 0; level <= litestream.SnapshotLevel; level++ {
-		info, err := replica.MaxLTXFileInfo(ctx, level)
+	if l0 > maxTXID {
+		maxTXID = l0
+	}
+	if l0 > 0 {
+		return maxTXID, nil
+	}
+	for level := 1; level < litestream.SnapshotLevel; level++ {
+		lvl, err := maxTXIDAtLevel(ctx, client, level)
 		if err != nil {
 			return 0, err
 		}
-		if info.MaxTXID > maxTXID {
-			maxTXID = info.MaxTXID
+		if lvl > maxTXID {
+			maxTXID = lvl
 		}
 	}
 	return maxTXID, nil
+}
+
+// maxTXIDAtLevel returns the highest transaction id among one level's LTX files, or 0
+// when the level holds none.
+func maxTXIDAtLevel(ctx context.Context, client litestream.ReplicaClient, level int) (ltx.TXID, error) {
+	itr, err := client.LTXFiles(ctx, level, 0, false)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = itr.Close() }()
+
+	var maxTXID ltx.TXID
+	for itr.Next() {
+		if info := itr.Item(); info.MaxTXID > maxTXID {
+			maxTXID = info.MaxTXID
+		}
+	}
+	if err := itr.Err(); err != nil {
+		return 0, err
+	}
+	return maxTXID, nil
+}
+
+// latestReplicaTXID probes the replica's highest committed transaction id. Every
+// caller of the probe goes through here, so they all share one client.
+func (db *DB) latestReplicaTXID(ctx context.Context) (ltx.TXID, error) {
+	client, err := db.probeClient(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return replicaLatestTXIDFunc(ctx, client)
+}
+
+// probeClient returns the replica client the latest-TXID probe reuses across calls,
+// building it on first use.
+//
+// The probe used to construct and Init a throwaway client per call — affordable once
+// per follower tick, not once per statement: for S3 that Init resolves the region and
+// credentials and stands up an HTTP transport, so the client, not the two listings,
+// was the probe's dominant cost. Reuse also keeps the connection pool warm across
+// calls. It stays its own client rather than the writer's replication client — the
+// reason the per-call construction gave — so a probe never shares state with a live
+// writer, and it goes through newReplicaClient like every other path, so an encrypted
+// replica is probed encrypted.
+func (db *DB) probeClient(ctx context.Context) (litestream.ReplicaClient, error) {
+	db.probeMu.Lock()
+	defer db.probeMu.Unlock()
+	if db.probe != nil {
+		return db.probe, nil
+	}
+	client, err := newReplicaClient(db.cfg.replica(), db.cfg.BackupTo)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Init(ctx); err != nil {
+		return nil, err // deliberately not cached: a failed Init is retried, not remembered
+	}
+	db.probe = client
+	return client, nil
 }
 
 // restoreDBFunc is the restore entry point used by the follower rebuild path

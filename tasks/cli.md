@@ -11,9 +11,9 @@ Semantics are exactly today's, unchanged: reads always come from the local
 file, a writer streams WAL to the replica every second, `RoleWriter` fails to
 open when the lease is held. The CLI is packaging, not architecture — a REPL
 plus flag parsing over `Open`, the returned `*sql.DB`, and `Close`. It lands
-last on this frontier because it consumes what sits above it:
-[exported-refresh.md](exported-refresh.md) supplies the per-statement pull, and
-`Config.OnRestoreProgress` (landed) the cold-open progress bar.
+last on this frontier because it consumes what sits above it: `(*DB).Refresh`
+(landed) supplies the per-statement pull, and `Config.OnRestoreProgress`
+(landed) the cold-open progress bar.
 
 ## Why
 
@@ -50,8 +50,8 @@ last on this frontier because it consumes what sits above it:
     logically one read of one version: refresh once at start, never
     per-statement. TTY detection on stdin decides which contract applies.
 - **The idea's three parking reasons are all discharged**: no exported
-  refresh and a disqualifying probe cost → [exported-refresh.md](exported-refresh.md),
-  scheduled above; batch cadence → decided, per the split above; transaction
+  refresh and a disqualifying probe cost → `(*DB).Refresh` and the two-listing
+  probe, landed; batch cadence → decided, per the split above; transaction
   suppression → decided, below.
 - **Refresh must not fire inside an explicit transaction.** The publish bumps
   the connector generation and in-flight connections re-dial against the new

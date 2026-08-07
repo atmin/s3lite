@@ -228,6 +228,21 @@ unchanged behaviour. The refresh replaces the local file underneath the stable h
 so a read that is in flight at the swap may see a rare, retryable error (the connection
 is dropped and re-dialed); keep the interval modest and retry.
 
+`db.Refresh(ctx)` is the same catch-up on demand: it pulls the replica's latest state
+synchronously and reports whether anything advanced, so a request handler (or an
+interactive shell) can force freshness right before a read instead of living with the
+interval — and it works with `FollowerRefreshInterval` unset, since that setting is the
+background cadence, not a prerequisite. It never takes the writer role (that is
+`TryPromote`) and costs two listings on a reused client when the replica has not moved,
+so calling it per read is affordable:
+
+```go
+if _, err := db.Refresh(ctx); err != nil {
+    return err // the follower keeps serving its current state
+}
+row := database.QueryRowContext(ctx, "SELECT ...")
+```
+
 > The incremental refresh depends on a small litestream fork (a follow-mode
 > resume fix); see [docs/litestream-fork.md](docs/litestream-fork.md).
 
@@ -246,7 +261,8 @@ you, not the library:
 
 - **Do not call `Close` from an `OnPromote`/`OnDemote`/`OnRefresh` callback.** Those
   callbacks run on the internal lease-loop goroutine, and `Close` blocks waiting for
-  that goroutine to exit — calling it from inside a callback deadlocks.
+  that goroutine to exit — calling it from inside a callback deadlocks. (An `OnRefresh`
+  fired by an explicit `Refresh` runs on the calling goroutine, but keep the rule.)
 - **Do not defeat `query_only` on a follower** (e.g. `PRAGMA query_only=0`). A
   follower's local writes never replicate and are silently destroyed by the next
   restore or refresh.
@@ -388,7 +404,9 @@ blank and rely on the instance role.
 - Followers serve their Open-time snapshot and only refresh on promotion unless
   `FollowerRefreshInterval` is set, which gives bounded-staleness near-live reads by
   periodically applying only the LTX committed since the follower's position
-  (incremental, but interval-driven — not continuous live WAL tailing).
+  (incremental, but interval-driven — not continuous live WAL tailing). `Refresh` runs
+  that same catch-up synchronously on demand, so a read that must not be stale can pay
+  for its own freshness.
 - A clean `Close` is durable: it flushes all committed writes to the replica
   before returning (bounded by `Config.ShutdownSyncTimeout`, default 30s). Only a
   *hard* crash/kill can lose the sub-second window since litestream's last sync.
