@@ -406,6 +406,37 @@ plaintext but carries no hostname).
 
 ---
 
+## 12. A replica a build is too old to read says so, and is never called corruption
+
+A replica written by a newer s3lite fails with `ErrReplicaFormatNewer` — "upgrade" —
+rather than with whatever internal the LTX decoder happened to raise. The old binary is
+the one that has to deliver this message, so it cannot be told about the format that
+defeated it; the classification is made from evidence it already holds.
+
+That evidence is what makes it a reading rather than a guess. The probe runs only on an
+already-failed read, and only after the object's bytes are known to be **authentic** —
+its frames authenticated under the configured key, or the replica is plaintext and there
+was never anything to authenticate. Authentic bytes are exactly what some writer wrote,
+because damage in transit or at rest fails the tag first (invariant 11). Bytes that are
+authentic, announce themselves as LTX, and still do not parse can only come from a
+format this build predates.
+
+The classifier is bounded by what it declines to claim, which matters more than what it
+claims: a body that is not LTX at all, and a truncated one, both stay unattributed and
+leave the original error to speak. A newer format is not short, it is unfamiliar —
+telling someone to upgrade over a damaged replica would send them away from the real
+problem. Only the header and the first page are read, since a format a reader is behind
+fails at the first structure it does not know.
+
+*Enforced by:* `TestReplicaWrittenByANewerBuildIsNamed` (keyed and plaintext: a real
+object of the replica's own, re-sealed with an undefined page-header flag bit set, is
+named and leaves no partial database — the shape of the real incident, an ltx v0.5.2
+writer's `PageHeaderFlagSize` meeting a v0.5.1 reader) and
+`TestProbeFormatCauseDeclinesWhatItCannotAttribute` (the quiet cases: parses-here,
+not-LTX, empty, truncated mid-header and mid-page).
+
+---
+
 ## The chaos soak
 
 `TestChaosSingleWriterDurability` exercises invariants 1, 2, 5, and 7 together: four

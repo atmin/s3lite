@@ -478,6 +478,12 @@ one part that reads the environment directly: its S3 flags fall back to
   is a single-key primitive — no rotation. Object names, sizes and timestamps stay
   visible, `lock.json` stays plaintext, and local files rest on host disk encryption.
   See [Client-side encryption](#client-side-encryption-the-bucket-never-sees-plaintext).
+- The replica's object format moves forward only: a newer s3lite reads what an older one
+  wrote, but not the reverse. Once a newer build has written to a replica, older builds
+  can no longer restore it — so mixed-version fleets should upgrade readers first. That
+  case is *named* rather than left to look like damage: it fails with
+  `s3lite.ErrReplicaFormatNewer`, which an application should surface as "upgrade" (see
+  INVARIANTS.md #12).
 
 ## Guarantees
 

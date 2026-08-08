@@ -1,6 +1,7 @@
 package s3lite
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -116,25 +117,38 @@ func unwrapReplicaClient(client litestream.ReplicaClient) litestream.ReplicaClie
 	}
 }
 
-// annotateEncryptionError names an encryption cause behind an already-failed read.
+// ErrReplicaFormatNewer reports a replica object that announces itself as an LTX file
+// and then does not parse as one — "this replica was written by a newer s3lite", not
+// "your database is corrupt". Consumers render it as an instruction to upgrade.
 //
-// It exists because litestream cannot carry ours up: `ltx.Compact` (v0.5.1) reads
-// each input's header under a named return and, on failure, does a bare `return` —
-// so the error is dropped and the closed output pipe surfaces as
-// "decode database: decode header: EOF" no matter what the input actually did. A
-// forgotten or wrong key would therefore read exactly like a corrupt database, which
-// is the one thing this feature must never look like.
+// It is a reading of the evidence rather than a guess. The object's frames
+// authenticated under the configured key (or the replica is plaintext and there is
+// nothing to authenticate), so its bytes are exactly the bytes some writer wrote —
+// damage in transit or at rest would have failed the tag first. Bytes that are
+// authentic, say LTX, and still do not parse can only have come from a format this
+// build predates.
+var ErrReplicaFormatNewer = errors.New("s3lite: the replica was written by a newer s3lite than this build can read")
+
+// annotateReplicaCause names the cause behind an already-failed replica read.
+//
+// It exists because the raw failure does not identify itself. Until ltx v0.5.2 it was
+// not even carried up: `ltx.Compact` read each input's header under a named return and,
+// on failure, did a bare `return`, so the closed output pipe surfaced as
+// "decode database: decode header: EOF" whatever the input had actually done. Upstream
+// fixed that, but what now arrives is an ltx internal — a wrong key and a replica a
+// build is too old to read both still read exactly like a corrupt database, which is
+// the one thing this must never look like.
 //
 // So on failure — only on failure, the happy path pays nothing — re-open the objects
 // the restore plan used under the configured settings and report what they say.
-func annotateEncryptionError(ctx context.Context, cfg replicaConfig, rawURL string, err error) error {
+func annotateReplicaCause(ctx context.Context, cfg replicaConfig, rawURL string, err error) error {
 	// A cancelled context is a shutdown, not a configuration problem — and the probe
 	// would fail on it anyway. Skipping it also keeps a repeatedly-failing follower
 	// refresh from adding a listing round trip per tick.
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	if cause := probeEncryptionCause(ctx, cfg, rawURL); cause != nil {
+	if cause := probeReplicaCause(ctx, cfg, rawURL); cause != nil {
 		// Both are wrapped: the caller needs errors.Is on the typed cause, and the
 		// original failure is what actually happened.
 		return fmt.Errorf("%w: %w", cause, err)
@@ -142,11 +156,11 @@ func annotateEncryptionError(ctx context.Context, cfg replicaConfig, rawURL stri
 	return err
 }
 
-// probeEncryptionCause returns the typed error the replica's own restore-plan objects
+// probeReplicaCause returns the typed error the replica's own restore-plan objects
 // produce under cfg, or nil when they read fine (so the failure was something else).
 // Best-effort by construction: it is a diagnostic, so anything that goes wrong along
 // the way just means "cannot tell".
-func probeEncryptionCause(ctx context.Context, cfg replicaConfig, rawURL string) error {
+func probeReplicaCause(ctx context.Context, cfg replicaConfig, rawURL string) error {
 	client, err := newReplicaClient(cfg, rawURL)
 	if err != nil || client.Init(ctx) != nil {
 		return nil
@@ -157,20 +171,23 @@ func probeEncryptionCause(ctx context.Context, cfg replicaConfig, rawURL string)
 	}
 	// Only the ends of the plan, never all of it: this runs on a failure that may
 	// repeat every follower-refresh tick, and sweeping the whole plan would cost a GET
-	// per object each time. Encryption is a whole-replica property, so either end
-	// answers it — and the two ends are exactly what the mixed window straddles, the
-	// oldest object being the one most likely to predate the key.
+	// per object each time. Both causes sit at an end. Encryption is a whole-replica
+	// property, so either end answers it — and the two ends are exactly what the mixed
+	// window straddles, the oldest object being the one most likely to predate the key.
+	// Format only ever moves forward, so a newer writer's objects arrive at the newest
+	// end, which is the end an older reader trips over first.
 	for _, info := range []*ltx.FileInfo{infos[0], infos[len(infos)-1]} {
-		if cause := probeEncryptionCauseForObject(ctx, cfg, client, info); cause != nil {
+		if cause := probeReplicaCauseForObject(ctx, cfg, client, info); cause != nil {
 			return cause
 		}
 	}
 	return nil
 }
 
-// probeEncryptionCauseForObject classifies one object against the configured
-// encryption settings.
-func probeEncryptionCauseForObject(ctx context.Context, cfg replicaConfig, client litestream.ReplicaClient, info *ltx.FileInfo) error {
+// probeReplicaCauseForObject classifies one object: first against the configured
+// encryption settings, then — once its bytes are known to be authentic — against what
+// this build can parse.
+func probeReplicaCauseForObject(ctx context.Context, cfg replicaConfig, client litestream.ReplicaClient, info *ltx.FileInfo) error {
 	rc, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 	if err != nil {
 		switch {
@@ -183,16 +200,57 @@ func probeEncryptionCauseForObject(ctx context.Context, cfg replicaConfig, clien
 	}
 	defer func() { _ = rc.Close() }()
 
-	if len(cfg.EncryptionKey) > 0 {
-		return nil // it opened, so its first frame authenticated under our key
+	body := io.Reader(rc)
+	if len(cfg.EncryptionKey) == 0 {
+		// With no key nothing is wrapped, so the object arrives raw and its magic says
+		// whether a key was needed.
+		magic := make([]byte, len(encMagic))
+		n, _ := io.ReadFull(rc, magic)
+		if n == len(encMagic) && string(magic) == encMagic {
+			return ErrReplicaEncrypted
+		}
+		// Not encrypted, so those bytes were the object's own: put them back for the
+		// format probe rather than pay a second GET to read them again.
+		body = io.MultiReader(bytes.NewReader(magic[:n]), rc)
 	}
-	// With no key nothing is wrapped, so the object arrives raw and its magic says
-	// whether a key was needed.
-	magic := make([]byte, len(encMagic))
-	if n, _ := io.ReadFull(rc, magic); n == len(encMagic) && string(magic) == encMagic {
-		return ErrReplicaEncrypted
+	// Past here the bytes are authentic — they opened under our key, or there is no key
+	// and there was nothing to authenticate — so anything unparseable in them was
+	// written that way.
+	return probeFormatCause(body)
+}
+
+// probeFormatCause reports ErrReplicaFormatNewer for a body that says LTX and then does
+// not parse under this build, and nil for everything else. Only the header and the
+// first page are read: a format this build is behind fails at the first structure it
+// does not know, and reading further would cost bytes to learn nothing.
+//
+// Everything it cannot attribute stays nil, which leaves the original error to speak
+// for itself. A body that is not an LTX file at all is not this diagnosis to make, and
+// neither is a truncated one — that is damage, and a newer format is not short, it is
+// unfamiliar.
+func probeFormatCause(body io.Reader) error {
+	magic := make([]byte, len(ltx.Magic))
+	if n, _ := io.ReadFull(body, magic); n != len(magic) || string(magic) != ltx.Magic {
+		return nil
 	}
-	return nil
+	dec := ltx.NewDecoder(io.MultiReader(bytes.NewReader(magic), body))
+	err := dec.DecodeHeader()
+	if err == nil {
+		var hdr ltx.PageHeader
+		err = dec.DecodePage(&hdr, make([]byte, dec.Header().PageSize))
+	}
+	switch {
+	case err == nil, errors.Is(err, io.EOF):
+		return nil // it parses here, so the failure was something else
+	case errors.Is(err, ErrKeyMismatch):
+		// A frame past the first one failed to authenticate: a wrong key, reaching us
+		// mid-stream rather than at the open.
+		return ErrKeyMismatch
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return nil
+	default:
+		return ErrReplicaFormatNewer
+	}
 }
 
 // replicaLatestTXIDFunc is the "latest replica position" probe used by follower
@@ -353,7 +411,7 @@ func restoreDB(ctx context.Context, cfg replicaConfig, rawURL, destPath string, 
 			logger.Info("s3lite: replica is empty; nothing to restore", "replica", rawURL)
 			return nil
 		}
-		return annotateEncryptionError(ctx, cfg, rawURL, fmt.Errorf("s3lite: restore: %w", err))
+		return annotateReplicaCause(ctx, cfg, rawURL, fmt.Errorf("s3lite: restore: %w", err))
 	}
 	progress.finish()
 	// Size comes from the file we just wrote rather than from litestream's restore plan:
@@ -468,7 +526,7 @@ func advanceFollowFile(ctx context.Context, cfg replicaConfig, rawURL, followPat
 
 	reached, err := runManagedFollow(ctx, replica, followPath, target)
 	if err != nil {
-		return reached, annotateEncryptionError(ctx, cfg, rawURL, fmt.Errorf("s3lite: follow: %w", err))
+		return reached, annotateReplicaCause(ctx, cfg, rawURL, fmt.Errorf("s3lite: follow: %w", err))
 	}
 	return reached, nil
 }
